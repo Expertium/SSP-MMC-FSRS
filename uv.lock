@@ -1384,6 +1384,7 @@ experiments = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pandas" },
     { name = "ruff" },
     { name = "scipy" },
 ]
@@ -1404,6 +1405,7 @@ provides-extras = ["experiments"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pandas", specifier = ">=2.0.0" },
     { name = "ruff", specifier = ">=0.14.13" },
     { name = "scipy", specifier = ">=1.17.0" },
 ]

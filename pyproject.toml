@@ -48,4 +48,5 @@ explicit = true
 dev = [
     "ruff>=0.14.13",
     "scipy>=1.17.0",
+    "pandas>=2.0.0",
 ]
