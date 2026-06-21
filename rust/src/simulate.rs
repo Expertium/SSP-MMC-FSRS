@@ -1,12 +1,14 @@
-//! Rust port of `simulate()` (roadmap step 1).
+//! Rust port of `simulate()` (roadmap step 1), f32 hot path.
 //!
 //! Reference / source of truth: `src/ssp_mmc_fsrs/simulation.py` with `rng_kind="shared"`
 //! and the policies in `src/ssp_mmc_fsrs/policies.py`.
 //!
-//! Precision is matched to Python per variable: **f64** for stability & retrievability,
-//! **f32** for due / difficulty / interval / ease / cost and the per-day outputs. The
-//! Anki-SM-2 interval math is done in **f32** because Python computes it on f32 tensors,
-//! and the half-up rounding inside it would otherwise flip at .5 boundaries.
+//! The simulator state and per-card math are **f32** (stability, retrievability,
+//! difficulty, intervals, costs) so the hot loops vectorize 8-wide on AVX2 via the f32
+//! `fastmath` approximations. This diverges from the f64 Python reference at the ~f32
+//! level, kept within the speedup protocol's drift budget. The RNG stream is still f64
+//! (counter-based), the memorized sum accumulates in f64, and per-deck constants are
+//! computed in f64 then cast to f32. Anki-SM-2 interval math was already f32.
 //!
 //! Params are **per-deck** (the `parallel` axis = users): `w` is `(parallel, n_w)`,
 //! costs/probs/offsets are `(parallel, k)`. The parity test broadcasts one user across
@@ -20,9 +22,9 @@ use pyo3::prelude::*;
 use crate::fastmath;
 use crate::rng;
 
-const S_MIN: f64 = 0.1;
-const STABILITY_INIT: f64 = 1e-10;
-const MEMRISE_SEQ: [f64; 6] = [1.0, 6.0, 12.0, 48.0, 96.0, 180.0];
+const S_MIN: f32 = 0.1;
+const STABILITY_INIT: f32 = 1e-10;
+const MEMRISE_SEQ: [f32; 6] = [1.0, 6.0, 12.0, 48.0, 96.0, 180.0];
 
 enum Policy {
     Fixed,
@@ -31,8 +33,8 @@ enum Policy {
     Sm2,
 }
 
-/// First index `i` with `u < cum[i]`, clipped to `cum.len()-1`.
-/// Matches `shared_rng.categorical` (numpy `searchsorted(side="right")` then clip).
+/// First index `i` with `u < cum[i]`, clipped to `cum.len()-1`. Operates on the f64 RNG
+/// uniforms. Matches `shared_rng.categorical`.
 #[inline]
 fn categorical(u: f64, cum: &[f64]) -> usize {
     let mut k = 0;
@@ -50,9 +52,9 @@ fn constrain_f32(x: f32, minimum: f32) -> f32 {
 
 /// Memrise: rung after the one closest to `prev` (np.argmin keeps the first minimum).
 #[inline]
-fn memrise_next_rung(prev: f64) -> f64 {
+fn memrise_next_rung(prev: f32) -> f32 {
     let mut best = 0usize;
-    let mut best_dist = f64::INFINITY;
+    let mut best_dist = f32::INFINITY;
     for (i, &v) in MEMRISE_SEQ.iter().enumerate() {
         let dist = (prev - v).abs();
         if dist < best_dist {
@@ -119,48 +121,57 @@ pub fn simulate<'py>(
     let cells = (parallel as u64) * (deck_size as u64);
     let span = learn_span as u64;
 
+    let max_cost_perday = max_cost_perday as f32;
+    let policy_param_f = policy_param as f32;
+    let policy_s_max_f = policy_s_max as f32;
+    let sim_s_max_f = sim_s_max as f32;
+
     for p in 0..parallel {
-        // --- per-deck constants ---
-        let decay = -w[[p, 20]];
-        let fc_factor = 0.9_f64.powf(1.0 / decay) - 1.0;
-        let exp_w8 = w[[p, 8]].exp();
-        let w9 = w[[p, 9]];
-        let w10 = w[[p, 10]];
-        let w11 = w[[p, 11]];
-        let w12 = w[[p, 12]];
-        let w13 = w[[p, 13]];
-        let w14 = w[[p, 14]];
-        let w15 = w[[p, 15]];
-        let w16 = w[[p, 16]];
-        let w17 = w[[p, 17]];
-        let w18 = w[[p, 18]];
-        let w4 = w[[p, 4]];
-        let w5 = w[[p, 5]];
-        let w6 = w[[p, 6]];
-        let w7 = w[[p, 7]];
-        let init_d4 = w4 - (3.0 * w5).exp() + 1.0;
-        let fail_div = (w17 * w18).exp();
-        let init_s = [w[[p, 0]], w[[p, 1]], w[[p, 2]], w[[p, 3]]];
+        // --- per-deck constants (computed in f64, cast to f32) ---
+        let decay = (-w[[p, 20]]) as f32;
+        let fc_factor = (0.9_f64.powf(1.0 / -w[[p, 20]]) - 1.0) as f32;
+        let exp_w8 = w[[p, 8]].exp() as f32;
+        let w9 = w[[p, 9]] as f32;
+        let w10 = w[[p, 10]] as f32;
+        let w11 = w[[p, 11]] as f32;
+        let w12 = w[[p, 12]] as f32;
+        let w13 = w[[p, 13]] as f32;
+        let w14 = w[[p, 14]] as f32;
+        let w15 = w[[p, 15]] as f32;
+        let w16 = w[[p, 16]] as f32;
+        let w4 = w[[p, 4]] as f32;
+        let w5 = w[[p, 5]] as f32;
+        let w6 = w[[p, 6]] as f32;
+        let w7 = w[[p, 7]] as f32;
+        let init_d4 = (w[[p, 4]] - (3.0 * w[[p, 5]]).exp() + 1.0) as f32;
+        let fail_div = (w[[p, 17]] * w[[p, 18]]).exp() as f32;
+        let init_s = [
+            w[[p, 0]] as f32,
+            w[[p, 1]] as f32,
+            w[[p, 2]] as f32,
+            w[[p, 3]] as f32,
+        ];
         let lc = [
-            learn_costs[[p, 0]],
-            learn_costs[[p, 1]],
-            learn_costs[[p, 2]],
-            learn_costs[[p, 3]],
+            learn_costs[[p, 0]] as f32,
+            learn_costs[[p, 1]] as f32,
+            learn_costs[[p, 2]] as f32,
+            learn_costs[[p, 3]] as f32,
         ];
         let rc = [
-            review_costs[[p, 0]],
-            review_costs[[p, 1]],
-            review_costs[[p, 2]],
-            review_costs[[p, 3]],
+            review_costs[[p, 0]] as f32,
+            review_costs[[p, 1]] as f32,
+            review_costs[[p, 2]] as f32,
+            review_costs[[p, 3]] as f32,
         ];
         let fro = [
-            first_rating_offset[[p, 0]],
-            first_rating_offset[[p, 1]],
-            first_rating_offset[[p, 2]],
-            first_rating_offset[[p, 3]],
+            first_rating_offset[[p, 0]] as f32,
+            first_rating_offset[[p, 1]] as f32,
+            first_rating_offset[[p, 2]] as f32,
+            first_rating_offset[[p, 3]] as f32,
         ];
-        let forget_off = forget_rating_offset[[p, 0]];
+        let forget_off = forget_rating_offset[[p, 0]] as f32;
 
+        // categorical tables stay f64 (used with the f64 RNG uniforms)
         let mut cum_first = [0.0f64; 4];
         let mut acc = 0.0;
         for i in 0..4 {
@@ -174,28 +185,28 @@ pub fn simulate<'py>(
             cum_review[i] = acc;
         }
 
-        // interval to (just past) policy_s_max at rating 3 -> ceil; shared by fixed/dr/memrise/sm2
-        let int_req = |s: f64, d: f64| -> f64 {
-            let c_coef = exp_w8 * (11.0 - d) * fastmath::pow(s, -w9);
-            let s_next = policy_s_max + 1e-3;
-            let max_r = (1.0 - fastmath::ln((s_next / s - 1.0) / c_coef + 1.0) / w10).max(0.01);
-            let ivl_raw = s / fc_factor * (fastmath::pow(max_r, 1.0 / decay) - 1.0);
+        // interval to (just past) policy_s_max at rating 3 -> ceil; shared by all policies
+        let int_req = |s: f32, d: f32| -> f32 {
+            let c_coef = exp_w8 * (11.0 - d) * fastmath::pow_f32(s, -w9);
+            let s_next = policy_s_max_f + 1e-3;
+            let max_r =
+                (1.0 - fastmath::ln_f32((s_next / s - 1.0) / c_coef + 1.0) / w10).max(0.01);
+            let ivl_raw = s / fc_factor * (fastmath::pow_f32(max_r, 1.0 / decay) - 1.0);
             ivl_raw.ceil().max(1.0)
         };
         // DR base interval: interval to reach desired retention -> floor
-        let ni_floor = |s: f64, r: f64| -> f64 {
-            (s / fc_factor * (fastmath::pow(r, 1.0 / decay) - 1.0))
+        let ni_floor = |s: f32, r: f32| -> f32 {
+            (s / fc_factor * (fastmath::pow_f32(r, 1.0 / decay) - 1.0))
                 .floor()
                 .max(1.0)
         };
 
         // --- per-card state ---
         let mut due = vec![learn_span as f32; deck_size];
-        let mut difficulty = vec![STABILITY_INIT as f32; deck_size];
+        let mut difficulty = vec![STABILITY_INIT; deck_size];
         let mut stability = vec![STABILITY_INIT; deck_size];
         let mut ease = vec![2.5f32; deck_size];
-        let mut retriev = vec![0.0f64; deck_size];
-        let mut delta_t = vec![0.0f32; deck_size];
+        let mut retriev = vec![0.0f32; deck_size];
         let mut last_date = vec![0.0f32; deck_size];
         let mut ivl = vec![0.0f32; deck_size];
         let mut rating = vec![0i32; deck_size];
@@ -222,30 +233,26 @@ pub fn simulate<'py>(
             // retrievability (uses end-of-previous-day stability)
             for c in 0..deck_size {
                 if stability[c] > STABILITY_INIT {
-                    delta_t[c] = today_f - last_date[c];
-                    let dt = delta_t[c] as f64;
-                    retriev[c] = fastmath::pow(1.0 + fc_factor * dt / stability[c], decay);
+                    let dt = today_f - last_date[c];
+                    retriev[c] = fastmath::pow_f32(1.0 + fc_factor * dt / stability[c], decay);
                 }
             }
 
-            // need_review, forget/rating draws, review cost. The forget/pass RNG draws
-            // are only consumed by due cards, and the RNG is counter-based (stateless),
-            // so skipping them for non-due cards is bit-identical and avoids ~all per-day
-            // draws for cards that aren't due.
+            // need_review, forget/rating draws (only for due cards), review cost
             for c in 0..deck_size {
                 cost[c] = 0.0;
                 let nr = due[c] <= today_f;
                 need_review[c] = nr;
                 if nr {
                     let cell = (p as u64) * (deck_size as u64) + (c as u64);
-                    let f = rng::uniform(base_forget + cell, seed) > retriev[c];
+                    let f = rng::uniform(base_forget + cell, seed) > retriev[c] as f64;
                     forget[c] = f;
                     rating[c] = if f {
                         1
                     } else {
                         (categorical(rng::uniform(base_pass + cell, seed), &cum_review) + 2) as i32
                     };
-                    cost[c] = rc[(rating[c] - 1) as usize] as f32;
+                    cost[c] = rc[(rating[c] - 1) as usize];
                 }
             }
 
@@ -258,7 +265,7 @@ pub fn simulate<'py>(
                     cum_cnt += 1;
                 }
                 true_review[c] = need_review[c]
-                    && (cum_cost as f64 <= max_cost_perday)
+                    && (cum_cost <= max_cost_perday)
                     && (cum_cnt <= review_limit_perday);
             }
 
@@ -270,13 +277,13 @@ pub fn simulate<'py>(
                 last_date[c] = today_f;
                 let s = stability[c];
                 let r = retriev[c];
-                let d = difficulty[c] as f64;
+                let d = difficulty[c];
                 let rt = rating[c];
                 let s_new = if forget[c] {
                     let t1 = w11
-                        * fastmath::pow(d, -w12)
-                        * (fastmath::pow(s + 1.0, w13) - 1.0)
-                        * fastmath::exp((1.0 - r) * w14);
+                        * fastmath::pow_f32(d, -w12)
+                        * (fastmath::pow_f32(s + 1.0, w13) - 1.0)
+                        * fastmath::exp_f32((1.0 - r) * w14);
                     t1.min(s / fail_div)
                 } else {
                     let hp = if rt == 2 { w15 } else { 1.0 };
@@ -284,28 +291,28 @@ pub fn simulate<'py>(
                     s * (1.0
                         + exp_w8
                             * (11.0 - d)
-                            * fastmath::pow(s, -w9)
-                            * (fastmath::exp((1.0 - r) * w10) - 1.0)
+                            * fastmath::pow_f32(s, -w9)
+                            * (fastmath::exp_f32((1.0 - r) * w10) - 1.0)
                             * hp
                             * eb)
                 };
-                stability[c] = s_new.clamp(S_MIN, sim_s_max);
+                stability[c] = s_new.clamp(S_MIN, sim_s_max_f);
 
-                let delta_d = -w6 * (rt as f64 - 3.0);
+                let delta_d = -w6 * (rt as f32 - 3.0);
                 let mut nd = d + delta_d * (10.0 - d) / 9.0;
                 nd = w7 * init_d4 + (1.0 - w7) * nd;
                 let mut d_new = nd.clamp(1.0, 10.0);
                 if forget[c] {
                     d_new = (d_new - w6 * forget_off).clamp(1.0, 10.0);
                 }
-                difficulty[c] = d_new as f32;
+                difficulty[c] = d_new;
             }
 
             // need_learn + learn cost (cost array now holds review AND learn costs)
             for c in 0..deck_size {
                 need_learn[c] = stability[c] == STABILITY_INIT;
                 if need_learn[c] {
-                    cost[c] = lc[(rating[c] - 1) as usize] as f32;
+                    cost[c] = lc[(rating[c] - 1) as usize];
                 }
             }
 
@@ -318,7 +325,7 @@ pub fn simulate<'py>(
                     cum_cnt += 1;
                 }
                 true_learn[c] = need_learn[c]
-                    && (cum_cost as f64 <= max_cost_perday)
+                    && (cum_cost <= max_cost_perday)
                     && (cum_cnt <= learn_limit_perday);
             }
 
@@ -329,9 +336,9 @@ pub fn simulate<'py>(
                 }
                 last_date[c] = today_f;
                 let rt = rating[c];
-                stability[c] = init_s[(rt - 1) as usize].clamp(S_MIN, sim_s_max);
-                let id = w4 - fastmath::exp(w5 * (rt as f64 - 1.0)) + 1.0;
-                difficulty[c] = (id - w6 * fro[(rt - 1) as usize]).clamp(1.0, 10.0) as f32;
+                stability[c] = init_s[(rt - 1) as usize].clamp(S_MIN, sim_s_max_f);
+                let id = w4 - fastmath::exp_f32(w5 * (rt as f32 - 1.0)) + 1.0;
+                difficulty[c] = (id - w6 * fro[(rt - 1) as usize]).clamp(1.0, 10.0);
             }
 
             // policy: new interval (and ease for SM-2) for reviewed-or-learned cards
@@ -340,37 +347,36 @@ pub fn simulate<'py>(
                     continue;
                 }
                 let s = stability[c];
-                let d = difficulty[c] as f64;
+                let d = difficulty[c];
                 let is_learn = true_learn[c];
                 let grade = rating[c];
 
-                let new_ivl: f64 = match pol {
+                let new_ivl: f32 = match pol {
                     Policy::Fixed => {
-                        if s > policy_s_max {
+                        if s > policy_s_max_f {
                             1e9
                         } else {
-                            policy_param.min(int_req(s, d))
+                            policy_param_f.min(int_req(s, d))
                         }
                     }
                     Policy::Dr => {
-                        if s > policy_s_max {
+                        if s > policy_s_max_f {
                             1e9
                         } else {
-                            ni_floor(s, policy_param).min(int_req(s, d))
+                            ni_floor(s, policy_param_f).min(int_req(s, d))
                         }
                     }
                     Policy::Memrise => {
-                        let prev = if is_learn { 0.0 } else { ivl[c] as f64 };
+                        let prev = if is_learn { 0.0 } else { ivl[c] };
                         if prev == 0.0 || grade == 1 {
                             1.0
-                        } else if s > policy_s_max {
+                        } else if s > policy_s_max_f {
                             1e9
                         } else {
                             memrise_next_rung(prev).min(int_req(s, d))
                         }
                     }
                     Policy::Sm2 => {
-                        // SM-2 interval math is f32, matching Python's f32 tensors.
                         let prev = if is_learn { 0.0f32 } else { ivl[c] };
                         let ease_in = if is_learn { 2.5f32 } else { ease[c] };
                         let ease_c = ease_in.clamp(1.3, 5.5);
@@ -405,19 +411,19 @@ pub fn simulate<'py>(
                             ne += 0.15;
                         }
                         ease[c] = ne.clamp(1.3, 5.5);
-                        let capped = if s > policy_s_max {
+                        let capped = if s > policy_s_max_f {
                             1e9
                         } else {
-                            (interval as f64).min(int_req(s, d))
+                            interval.min(int_req(s, d))
                         };
                         capped.round_ties_even()
                     }
                 };
-                ivl[c] = new_ivl as f32;
+                ivl[c] = new_ivl;
                 due[c] = today_f + ivl[c];
             }
 
-            // per-day aggregates
+            // per-day aggregates (memorized accumulates in f64 for an accurate sum)
             let mut rev = 0u32;
             let mut lrn = 0u32;
             let mut mem = 0.0f64;
@@ -429,7 +435,7 @@ pub fn simulate<'py>(
                 if true_learn[c] {
                     lrn += 1;
                 }
-                mem += retriev[c];
+                mem += retriev[c] as f64;
                 if true_review[c] || true_learn[c] {
                     cst += cost[c] as f64;
                 }
