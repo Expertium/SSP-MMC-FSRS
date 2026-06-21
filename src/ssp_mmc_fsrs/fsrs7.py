@@ -32,6 +32,8 @@ reference's index comments):
   31 d_weight, 32 d_decay, 33 s_decay1
 """
 
+import math
+
 import torch
 
 # Memory-state clamp bounds (model.rs S_MIN/S_MAX, D_MIN/D_MAX in fsrs-rs). S_MAX and the
@@ -187,3 +189,125 @@ def step(delta_t, rating, s_long, s_short, d, w, s_min, s_max=S_MAX):
     new_s_short = torch.where(is_first, init_s_short, upd_s_short)
     new_d = torch.where(is_first, init_d_, upd_d)
     return new_s_long, new_s_short, new_d
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Interval inversion (scheduling): find t such that forgetting_curve(t, ...) = dr.
+# The dual-stability curve has no closed-form inverse, so we root-find. We use Brent's
+# method (bracketing: inverse-quadratic / secant / bisection) in log(t) space, inverting
+# the FULL forgetting_curve p (the same value the simulator uses to decide recall). Used
+# by the FSRS-7 policies (roadmap step 2c).
+#
+# Why Brent and not Newton: tests/newton_steps_study.py compares both, vectorized, against
+# a scipy.brentq golden over a grid of states x DR in [0.60, 0.99] x real param sets.
+# Brent converges to machine precision in ~1 step for the median case and reaches
+# worst-case interval error < 0.1% in 12 iterations; a safeguarded-Newton (rtsafe) variant
+# needed >20 (its steps, started from the bracket midpoint, are repeatedly rejected) AND
+# costs ~2x the transcendentals per iteration (it also needs dR/dt). So Brent is both
+# faster-converging and cheaper here.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Shortest schedulable interval: 1 minute, in days.
+MIN_INTERVAL_DAYS = 1.0 / 1440.0
+
+# Brent iterations for the interval inversion (worst-case interval error < 0.1% over
+# DR in [0.60, 0.99]; the median case is exact in 1 step). See tests/newton_steps_study.py.
+INVERSE_N_ITER = 12
+
+
+def forgetting_curve_inverse(
+    dr,
+    s_long,
+    s_short,
+    d,
+    w,
+    n_iter=INVERSE_N_ITER,
+    min_t=MIN_INTERVAL_DAYS,
+    max_t=S_MAX,
+):
+    """Interval ``t`` (days) at which the dual-stability recall probability equals ``dr``,
+    via a vectorized Brent's method in ``u = log(t)`` (classic Dekker-Brent: inverse-
+    quadratic / secant / bisection, all branch-free through torch.where). ``dr`` and the
+    state tensors are broadcastable. The root is bracketed by the two single-component
+    inverses t1* (short) and t2* (long) -- where r1, resp. r2, alone equals dr -- because
+    p is their decreasing weighted mix; clamping that bracket to ``[min_t, max_t]`` also
+    collapses an UNREACHABLE dr (root past a bound) onto that bound. Result in
+    ``[min_t, max_t]``."""
+    decay1 = -(w[23] * s_short.pow(w[33] - 0.3)).clamp(0.01, 0.95)
+    factor1 = (w[25].log() * decay1.pow(-1.0)).clamp(max=60.0).exp() - 1.0
+    a1 = factor1 / s_short
+
+    decay2 = -w[24].clamp(0.01, 0.95)
+    factor2 = w[26].pow(decay2.pow(-1.0)) - 1.0
+    d_timescale = ((d - 5.0) * (w[32] - 0.3)).exp()
+    a2 = factor2 * d_timescale / s_long
+
+    weight1 = w[27] * s_short.pow(-w[29])
+    weight2 = w[28] * s_long.pow(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp()
+    wt_sum = (weight1 + weight2).clamp(min=1e-9)
+
+    log_min = math.log(min_t)
+    log_max = math.log(max_t)
+    scale = 1.0 - 2e-5
+    dr_t = torch.as_tensor(dr, dtype=s_long.dtype, device=s_long.device)
+    tol = 1e-12
+
+    def f_of_u(u):
+        t = u.exp()
+        inner1 = a1 * t + 1.0
+        inner2 = a2 * t + 1.0
+        p = (weight1 * inner1.pow(decay1) + weight2 * inner2.pow(decay2)) / wt_sum
+        return p * scale + 1e-5 - dr_t
+
+    # Tight initial bracket [a, b] from the single-component inverses (clamped to range).
+    t1 = ((dr_t.pow(1.0 / decay1) - 1.0) / a1).clamp(min=1e-12)
+    t2 = ((dr_t.pow(1.0 / decay2) - 1.0) / a2).clamp(min=1e-12)
+    a = torch.minimum(t1, t2).log().clamp(log_min, log_max)
+    b = torch.maximum(t1, t2).log().clamp(log_min, log_max)
+    fa = f_of_u(a)
+    fb = f_of_u(b)
+
+    # Brent keeps |f(b)| <= |f(a)| (b is the running best estimate).
+    sw = fa.abs() < fb.abs()
+    a, b = torch.where(sw, b, a), torch.where(sw, a, b)
+    fa, fb = torch.where(sw, fb, fa), torch.where(sw, fa, fb)
+    c, fc = a.clone(), fa.clone()
+    dd = a.clone()
+    mflag = torch.ones_like(b, dtype=torch.bool)
+
+    for _ in range(n_iter):
+        use_iq = (fa != fc) & (fb != fc)
+        s_iq = (
+            a * fb * fc / ((fa - fb) * (fa - fc))
+            + b * fa * fc / ((fb - fa) * (fb - fc))
+            + c * fa * fb / ((fc - fa) * (fc - fb))
+        )
+        dsec = torch.where(fb - fa == 0, torch.full_like(fa, 1e-30), fb - fa)
+        s_sec = b - fb * (b - a) / dsec
+        s = torch.where(use_iq, s_iq, s_sec)
+
+        # Conditions forcing a bisection step (s outside [(3a+b)/4, b], or steps stalling).
+        lo_b = (3.0 * a + b) / 4.0
+        not_between = (s - lo_b) * (s - b) >= 0.0
+        cond2 = mflag & ((s - b).abs() >= (b - c).abs() / 2.0)
+        cond3 = (~mflag) & ((s - b).abs() >= (c - dd).abs() / 2.0)
+        cond4 = mflag & ((b - c).abs() < tol)
+        cond5 = (~mflag) & ((c - dd).abs() < tol)
+        bis = not_between | cond2 | cond3 | cond4 | cond5
+        s = torch.where(bis, 0.5 * (a + b), s)
+        mflag = bis
+
+        fs = f_of_u(s)
+        dd = c
+        c, fc = b, fb
+        # Replace the endpoint that keeps the root bracketed (f changes sign across [a, b]).
+        side = fa * fs < 0.0
+        a = torch.where(side, a, s)
+        fa = torch.where(side, fa, fs)
+        b = torch.where(side, s, b)
+        fb = torch.where(side, fs, fb)
+        sw = fa.abs() < fb.abs()
+        a, b = torch.where(sw, b, a), torch.where(sw, a, b)
+        fa, fb = torch.where(sw, fb, fa), torch.where(sw, fa, fb)
+
+    return b.clamp(log_min, log_max).exp()
