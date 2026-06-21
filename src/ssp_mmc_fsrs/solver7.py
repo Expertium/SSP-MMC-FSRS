@@ -35,6 +35,70 @@ import torch
 
 from . import fsrs7
 
+# Optional fused value-iteration kernel (GPU only). A custom Triton kernel computes, per
+# state, min over actions of [const_cost + discount * sum_g prob_g * V[next_g]] entirely in
+# registers -- it never materializes the (n_states, r_size) action-value array and reads the
+# transition indices as int32, cutting per-iteration memory traffic ~3x vs the eager path.
+try:
+    import triton
+    import triton.language as tl
+
+    HAS_TRITON = torch.cuda.is_available()
+except ImportError:
+    HAS_TRITON = False
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _bellman_step_kernel(
+        state_ptr,
+        const_cost_ptr,
+        r_pred_ptr,
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,
+        new_state_ptr,
+        n_states,
+        r_size,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+        R_BLOCK: tl.constexpr,
+    ):
+        """One Bellman backup for a single state (vectorized over the R_BLOCK actions).
+
+        new_state[s] = min(state[s], min_r [ const_cost[s,r]
+                          + discount * ( (1-rp)*V[t0] + rp*rrp0*V[t1]
+                                       + rp*rrp1*V[t2] + rp*rrp2*V[t3] ) ])
+        where rp = r_pred[s,r] and t0..t3 = transition[s,r] (int32 flat next-state indices).
+        """
+        s = tl.program_id(0)
+        r = tl.arange(0, R_BLOCK)
+        mask = r < r_size
+        base = s * r_size + r
+        cc = tl.load(const_cost_ptr + base, mask=mask, other=float("inf"))
+        rp = tl.load(r_pred_ptr + base, mask=mask, other=0.0)
+        i0 = tl.load(t0_ptr + base, mask=mask, other=0)
+        i1 = tl.load(t1_ptr + base, mask=mask, other=0)
+        i2 = tl.load(t2_ptr + base, mask=mask, other=0)
+        i3 = tl.load(t3_ptr + base, mask=mask, other=0)
+        v0 = tl.load(state_ptr + i0, mask=mask, other=0.0)
+        v1 = tl.load(state_ptr + i1, mask=mask, other=0.0)
+        v2 = tl.load(state_ptr + i2, mask=mask, other=0.0)
+        v3 = tl.load(state_ptr + i3, mask=mask, other=0.0)
+        prob0 = 1.0 - rp
+        av = cc + discount * (
+            prob0 * v0 + rp * rrp0 * v1 + rp * rrp1 * v2 + rp * rrp2 * v3
+        )
+        av = tl.where(mask, av, float("inf"))
+        row_min = tl.min(av, axis=0)
+        s_old = tl.load(state_ptr + s)
+        tl.store(new_state_ptr + s, tl.minimum(s_old, row_min))
+
+
 # ── Grid constants (FSRS-7) ──────────────────────────────────────────────────
 S_MIN = 1e-4  # FSRS-7 --secs stability floor
 S_MAX = (
@@ -49,7 +113,7 @@ D_EPS = 0.1  # difficulty grid spacing -> 91 points
 
 R_MIN = 0.60  # FSRS-7 DR range expands to [0.60, 0.99]
 R_MAX = 0.99
-R_EPS = 0.01
+R_EPS = 0.01  # 40 candidate target-retention actions (full fidelity)
 
 COST_MAX = 1_000_000.0
 DISCOUNT_FACTOR = 0.97  # OFF-LIMITS as the convergence fix (per CLAUDE.md)
@@ -85,6 +149,7 @@ class SSPMMCSolver7:
         device=None,
         n_s=N_S,
         dtype=torch.float32,
+        engine="auto",
     ):
         # Per-user inputs (CLAUDE.md: per-user FSRS params + per-button costs + H/G/E probs).
         self.review_costs = np.asarray(review_costs, dtype=np.float64)
@@ -96,6 +161,10 @@ class SSPMMCSolver7:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.n_s = n_s
+        # Value-iteration engine: "auto" (Triton kernel on CUDA, else eager), or force
+        # "triton"/"eager" -- used to cross-check the fused kernel against eager.
+        assert engine in ("auto", "triton", "eager")
+        self.engine = engine
         self._init_state_spaces()
         self._build_transitions()
 
@@ -166,7 +235,9 @@ class SSPMMCSolver7:
         self._ss3 = s_g.view(1, 1, -1)
 
         n_states, r_size, s_size = self.n_states, self.r_size, self.s_size
-        # Preallocated persistent outputs (int32 transitions; f-dtype recall).
+        # Preallocated persistent outputs. int32 transitions: the fused Triton kernel reads
+        # them directly (int32 pointer offsets), halving index bandwidth vs int64; the eager
+        # fallback casts to int64 only where torch advanced indexing requires it.
         self._transitions = [
             torch.empty((n_states, r_size), device=dev, dtype=torch.int32)
             for _ in range(4)
@@ -274,6 +345,117 @@ class SSPMMCSolver7:
             )
         return const_cost
 
+    def _branch_probs(self):
+        """The 4 per-rating branch-probability arrays (fail, H, G, E) as (n_states, r_size)
+        tensors, derived from the cached ``r_pred``. Precomputed once per solve so the value
+        iteration doesn't recompute them every step."""
+        rp = self._r_pred_flat
+        rrp = self.review_rating_prob
+        return [
+            1.0 - rp,
+            rp * float(rrp[0]),
+            rp * float(rrp[1]),
+            rp * float(rrp[2]),
+        ]
+
+    def _use_triton(self):
+        if self.engine == "eager":
+            return False
+        if self.engine == "triton":
+            assert HAS_TRITON and self.device == "cuda", "Triton engine unavailable"
+            return True
+        return HAS_TRITON and self.device == "cuda" and self.dtype == torch.float32
+
+    def _run_iteration(self, const_cost, n_iter, convergence_tol):
+        """Core value iteration. Returns ``(state, it, cost_diff)`` with ``state`` the flat
+        cost-to-go (n_states,). Dispatches to the fused Triton kernel on CUDA, else eager."""
+        if self._use_triton():
+            return self._run_iteration_triton(const_cost, n_iter, convergence_tol)
+        return self._run_iteration_eager(const_cost, n_iter, convergence_tol)
+
+    def _run_iteration_triton(self, const_cost, n_iter, convergence_tol):
+        """Fused value iteration via ``_bellman_step_kernel`` (no action-value array). Ping-
+        pongs two ``state`` buffers (Jacobi backup: all reads from the previous iterate)."""
+        rrp = self.review_rating_prob
+        rrp0, rrp1, rrp2 = float(rrp[0]), float(rrp[1]), float(rrp[2])
+        const_cost = const_cost.contiguous()
+        t0, t1, t2, t3 = self._transitions
+        state = self._state_init.clone()
+        new_state = torch.empty_like(state)
+        r_block = triton.next_power_of_2(self.r_size)
+        grid = (self.n_states,)
+        it = 0
+        cost_diff = 1e9
+        while it < n_iter and cost_diff > convergence_tol:
+            it += 1
+            _bellman_step_kernel[grid](
+                state,
+                const_cost,
+                self._r_pred_flat,
+                t0,
+                t1,
+                t2,
+                t3,
+                new_state,
+                self.n_states,
+                self.r_size,
+                rrp0,
+                rrp1,
+                rrp2,
+                DISCOUNT_FACTOR,
+                R_BLOCK=r_block,
+            )
+            check_interval = 10 if it <= 100 else 25
+            if it % check_interval == 0:
+                cost_diff = (state - new_state).max().item()
+            state, new_state = new_state, state
+        return state, it, cost_diff
+
+    def _run_iteration_eager(self, const_cost, n_iter, convergence_tol):
+        """Eager (CPU / no-Triton) value iteration: ``addcmul_`` to fuse ``prob*gather``
+        into the accumulate, ``amin`` for the action min. Casts int32 transitions to int64
+        for torch advanced indexing."""
+        branch_probs = self._branch_probs()
+        transitions = [t.long() for t in self._transitions]
+        state = self._state_init.clone()
+        it = 0
+        cost_diff = 1e9
+        while it < n_iter and cost_diff > convergence_tol:
+            it += 1
+            action_value = const_cost.clone()
+            for prob, trans in zip(branch_probs, transitions):
+                action_value.addcmul_(prob, state[trans], value=DISCOUNT_FACTOR)
+            optimal_value = torch.amin(action_value, dim=-1)
+            check_interval = 10 if it <= 100 else 25
+            if it % check_interval == 0:
+                new_state = torch.minimum(state, optimal_value)
+                cost_diff = (state - new_state).max().item()
+                state = new_state
+            else:
+                torch.minimum(state, optimal_value, out=state)
+        return state, it, cost_diff
+
+    def _argmin_action(self, const_cost, state):
+        """One extra eager backup at the converged ``state`` to recover the argmin action
+        (the chosen target-retention index per state)."""
+        branch_probs = self._branch_probs()
+        action_value = const_cost.clone()
+        for prob, trans in zip(branch_probs, self._transitions):
+            action_value.addcmul_(prob, state[trans.long()], value=DISCOUNT_FACTOR)
+        return action_value.argmin(dim=-1)
+
+    def measure_convergence(self, hyperparams, n_iter=3000, convergence_tol=0.1):
+        """Run value iteration and return ``(converged, frac_at_max, iters)`` WITHOUT
+        building the retention matrix -- the cheap path for the convergence sweep. A user's
+        set "converges" iff fewer than 1/20 of states stay pinned at the max cost (the
+        FSRS-6 ``converge.py`` criterion)."""
+        with torch.inference_mode():
+            const_cost = self._const_cost(hyperparams)
+            state, it, _ = self._run_iteration(const_cost, n_iter, convergence_tol)
+            actual_max = state.max()
+            frac = float((state == actual_max).sum().item()) / state.numel()
+        return frac < (1.0 / 20.0), frac, it
+
     def solve(self, hyperparams, n_iter=100_000, convergence_tol=0.1, verbose=True):
         """Run value iteration; return ``(cost_matrix, retention_matrix)`` as numpy arrays
         of shape ``(d_size, s_size, s_size)`` indexed ``[d, s_long, s_short]``.
@@ -290,31 +472,12 @@ class SSPMMCSolver7:
         per the S transforms and ``(D-1)/9`` for difficulty.
         """
         start = time.perf_counter()
-        rp = self._r_pred_flat
-        rrp = self.review_rating_prob
-        # Per-rating branch-prob coefficients: fail uses (1 - r_pred), H/G/E use
-        # r_pred * review_rating_prob[g]. Recomputed inside the loop (transient, freed each
-        # gather) rather than stored, to keep VRAM low.
-        prob_coeffs = [None, float(rrp[0]), float(rrp[1]), float(rrp[2])]
         with torch.inference_mode():
             const_cost = self._const_cost(hyperparams)
-            state = self._state_init.clone()
-            it = 0
-            cost_diff = 1e9
-            optimal_action = None
-            while it < n_iter and cost_diff > convergence_tol:
-                it += 1
-                action_value = const_cost.clone()
-                for trans, coeff in zip(self._transitions, prob_coeffs):
-                    prob = (1.0 - rp) if coeff is None else (rp * coeff)
-                    action_value += DISCOUNT_FACTOR * prob * state[trans.long()]
-                optimal_value, optimal_action = action_value.min(dim=-1)
-                optimal_value = torch.minimum(state, optimal_value)
-                check_interval = 10 if it <= 100 else 25
-                if it % check_interval == 0:
-                    cost_diff = torch.abs(optimal_value - state).max().item()
-                state = optimal_value
-
+            state, it, cost_diff = self._run_iteration(
+                const_cost, n_iter, convergence_tol
+            )
+            optimal_action = self._argmin_action(const_cost, state)
             cost_flat = state.cpu().numpy()
             action_flat = optimal_action.cpu().numpy()
         if verbose:

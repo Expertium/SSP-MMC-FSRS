@@ -87,11 +87,6 @@ def load_jsonl_by_user(path):
     return out
 
 
-def frac_at_max(cost_matrix):
-    actual_max = cost_matrix.max()
-    return float((cost_matrix == actual_max).sum()) / cost_matrix.size
-
-
 def parse_args():
     p = argparse.ArgumentParser(
         description="FSRS-7 Bellman convergence sweep (step 3)."
@@ -170,11 +165,8 @@ def main():
         worst_frac = 0.0
         for si, hp in enumerate(hp_sets):
             ts = time.perf_counter()
-            cost_matrix, _ = solver.solve(
-                hp, n_iter=args.n_iter, verbose=args.calibrate
-            )
+            _, fm, iters = solver.measure_convergence(hp, n_iter=args.n_iter)
             solve_times.append(time.perf_counter() - ts)
-            fm = frac_at_max(cost_matrix)
             worst_frac = max(worst_frac, fm)
             set_converged = fm < args.unconverged_frac
             if not set_converged:
@@ -182,7 +174,7 @@ def main():
             if args.calibrate:
                 print(
                     f"  user {user_id} set {si:2d}: frac_at_max={fm:.4%} "
-                    f"{'OK' if set_converged else 'NOT CONVERGED'}"
+                    f"iters={iters} {'OK' if set_converged else 'NOT CONVERGED'}"
                 )
 
         results[user_id] = {

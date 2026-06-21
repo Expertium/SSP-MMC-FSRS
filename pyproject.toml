@@ -16,6 +16,7 @@ experiments = [
     "ax-platform>=1.2.1",
     "matplotlib>=3.10.8",
     "colorama>=0.4.6",
+    "triton-windows>=3.7.1.post27 ; sys_platform == 'win32'",
 ]
 
 [build-system]
