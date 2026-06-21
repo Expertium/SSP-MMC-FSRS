@@ -78,6 +78,27 @@ def uniform_block(kind, day, parallel, deck_size, learn_span, key):
     return uniform(counters(kind, day, parallel, deck_size, learn_span), key)
 
 
+def counters_r(kind, day, rnd, parallel, deck_size, learn_span, max_rounds):
+    """(parallel, deck_size) counters with an extra same-day **round** dimension, for the
+    FSRS-7 simulator (which can review a card several times a day).
+
+    Layout: ``((kind * learn_span + day) * max_rounds + rnd) * cells + cell``. With
+    ``rnd = 0`` for the once-per-card initial rating this stays disjoint across kinds, and
+    the Rust simulator derives the identical counter per (day, round, deck, card) cell.
+    """
+    cells = parallel * deck_size
+    base = np.uint64(((kind * learn_span + day) * max_rounds + rnd) * cells)
+    idx = np.arange(cells, dtype=np.uint64).reshape(parallel, deck_size)
+    return base + idx
+
+
+def uniform_block_r(kind, day, rnd, parallel, deck_size, learn_span, max_rounds, key):
+    """Round-aware ``uniform_block`` for one (parallel, deck_size) block (FSRS-7)."""
+    return uniform(
+        counters_r(kind, day, rnd, parallel, deck_size, learn_span, max_rounds), key
+    )
+
+
 def categorical(uniforms, probs):
     """Category indices: first i with ``u < cumsum(probs)[i]`` (clipped to k-1).
 

@@ -29,6 +29,7 @@ import torch
 from tqdm import trange
 
 from . import fsrs7
+from . import shared_rng
 from .config import (
     DEFAULT_LEARN_COSTS,
     DEFAULT_REVIEW_COSTS,
@@ -61,7 +62,10 @@ def simulate(
     s_max=fsrs7.S_MAX,
     max_same_day=10,
     progress_desc=None,
+    rng_kind="torch",
 ):
+    if rng_kind not in ("torch", "shared"):
+        raise ValueError(f"Unknown rng_kind: {rng_kind!r} (use 'torch' or 'shared')")
     torch.manual_seed(seed)
     np.random.seed(seed)
     dtype = torch.float64
@@ -81,14 +85,33 @@ def simulate(
     reps = torch.zeros_like(s_long)
     lapses = torch.zeros_like(s_long)
 
-    # First-review rating per card (same across decks, as in the FSRS-6 torch path).
-    first_ratings = np.random.choice([1, 2, 3, 4], deck_size, p=first_rating_prob)
-    first_rating = (
-        torch.as_tensor(first_ratings, dtype=torch.int64, device=device)
-        .unsqueeze(0)
-        .expand(parallel, deck_size)
-        .contiguous()
-    )
+    # First-review rating per card. torch path: drawn once per card, broadcast across decks.
+    # shared path: per-(deck, card) counter draw (KIND_INIT_RATING, round 0) so it matches
+    # the Rust simulator cell-for-cell.
+    if rng_kind == "torch":
+        first_ratings = np.random.choice([1, 2, 3, 4], deck_size, p=first_rating_prob)
+        first_rating = (
+            torch.as_tensor(first_ratings, dtype=torch.int64, device=device)
+            .unsqueeze(0)
+            .expand(parallel, deck_size)
+            .contiguous()
+        )
+    else:
+        u0 = shared_rng.uniform_block_r(
+            shared_rng.KIND_INIT_RATING,
+            0,
+            0,
+            parallel,
+            deck_size,
+            learn_span,
+            max_same_day,
+            seed,
+        )
+        first_rating = torch.as_tensor(
+            shared_rng.categorical(u0, first_rating_prob) + 1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     review_costs_t = torch.as_tensor(review_costs, dtype=dtype, device=device)
     learn_costs_t = torch.as_tensor(learn_costs, dtype=dtype, device=device)
@@ -141,10 +164,39 @@ def simulate(
             dt = (t_review - last_date).clamp(min=0.0)
             sl_c, ss_c, d_c = clamp_state(s_long, s_short, diff)
             r = fsrs7.forgetting_curve(dt, sl_c, ss_c, d_c, w_t)
-            forget = torch.rand(shape, dtype=dtype, device=device) > r
-            pass_idx = torch.multinomial(
-                review_rating_prob_t, parallel * deck_size, replacement=True
-            ).view(shape)
+            if rng_kind == "torch":
+                rand = torch.rand(shape, dtype=dtype, device=device)
+                pass_idx = torch.multinomial(
+                    review_rating_prob_t, parallel * deck_size, replacement=True
+                ).view(shape)
+            else:  # shared: per-(day, round, deck, card) counter draws
+                u_f = shared_rng.uniform_block_r(
+                    shared_rng.KIND_FORGET,
+                    today,
+                    rnd,
+                    parallel,
+                    deck_size,
+                    learn_span,
+                    max_same_day,
+                    seed,
+                )
+                rand = torch.as_tensor(u_f, dtype=dtype, device=device)
+                u_p = shared_rng.uniform_block_r(
+                    shared_rng.KIND_PASS_RATING,
+                    today,
+                    rnd,
+                    parallel,
+                    deck_size,
+                    learn_span,
+                    max_same_day,
+                    seed,
+                )
+                pass_idx = torch.as_tensor(
+                    shared_rng.categorical(u_p, review_rating_prob),
+                    dtype=torch.int64,
+                    device=device,
+                )
+            forget = rand > r
             pass_rating = pass_ratings[pass_idx]
             rev_rating = torch.where(forget, torch.ones_like(pass_rating), pass_rating)
 

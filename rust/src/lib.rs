@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 mod fastmath;
 mod rng;
 mod simulate;
+mod simulate7;
 
 /// Return the crate version. Trivial smoke-test that the module imports and calls.
 #[pyfunction]
@@ -28,5 +29,6 @@ fn ssp_mmc_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add, m)?)?;
     m.add_function(wrap_pyfunction!(rng::rng_uniforms, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::simulate, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate7::simulate_fsrs7, m)?)?;
     Ok(())
 }
