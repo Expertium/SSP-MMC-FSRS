@@ -1,0 +1,6 @@
+# Build the simulator for the host CPU (Ryzen 5950X: AVX2 + FMA). This makes the binary
+# non-portable across CPU microarchitectures, but a from-source build (maturin develop)
+# always targets the build machine, so source distribution is fine. FMA contraction
+# changes floating-point results at the ULP level (gated by the speedup drift checks).
+[build]
+rustflags = ["-C", "target-cpu=native"]
