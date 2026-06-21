@@ -227,21 +227,23 @@ pub fn simulate<'py>(
                 }
             }
 
-            // need_review, forget draw, rating draw, review cost
+            // need_review, forget/rating draws, review cost. The forget/pass RNG draws
+            // are only consumed by due cards, and the RNG is counter-based (stateless),
+            // so skipping them for non-due cards is bit-identical and avoids ~all per-day
+            // draws for cards that aren't due.
             for c in 0..deck_size {
                 cost[c] = 0.0;
-                need_review[c] = due[c] <= today_f;
-                let cell = (p as u64) * (deck_size as u64) + (c as u64);
-                forget[c] = rng::uniform(base_forget + cell, seed) > retriev[c];
-                if need_review[c] && forget[c] {
-                    rating[c] = 1;
-                }
-                let pass_rating =
-                    (categorical(rng::uniform(base_pass + cell, seed), &cum_review) + 2) as i32;
-                if need_review[c] && !forget[c] {
-                    rating[c] = pass_rating;
-                }
-                if need_review[c] {
+                let nr = due[c] <= today_f;
+                need_review[c] = nr;
+                if nr {
+                    let cell = (p as u64) * (deck_size as u64) + (c as u64);
+                    let f = rng::uniform(base_forget + cell, seed) > retriev[c];
+                    forget[c] = f;
+                    rating[c] = if f {
+                        1
+                    } else {
+                        (categorical(rng::uniform(base_pass + cell, seed), &cum_review) + 2) as i32
+                    };
                     cost[c] = rc[(rating[c] - 1) as usize] as f32;
                 }
             }

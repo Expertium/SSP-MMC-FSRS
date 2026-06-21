@@ -5,3 +5,4 @@ Workload: 50 users x DR [0.7, 0.9, 0.99], parallel=1, deck=10000, span=1825, see
 | timestamp | iter | speedup (med) | wilcoxon p | mem drift avg/max % | time drift avg/max % | C1 | C2 | C3 | C4 | accept | comment |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-06-21 19:09:40 | 0 | 0.999x | 0.8015 | 0.000/0.000 | 0.000/0.000 | FAIL | FAIL | PASS | PASS | baseline | baseline: current Rust simulator (commit 58aa055), FSRS-6 DR policy |
+| 2026-06-21 19:20:51 | 1 | 1.220x | 1.17e-26 | 0.000/0.000 | 0.000/0.000 | PASS | PASS | PASS | PASS | ACCEPT | skip forget/pass RNG draws for non-due cards (counter-based -> bit-identical) |
