@@ -1,0 +1,21 @@
+[package]
+name = "ssp_mmc_rust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the SSP-MMC-FSRS simulator (for speed). Reference: src/ssp_mmc_fsrs/simulation.py"
+
+[lib]
+name = "ssp_mmc_rust"
+# cdylib: build a C-ABI dynamic library that Python can import as an extension module.
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+ndarray = "0.16"
+
+[profile.release]
+# The simulator is numeric and hot; optimize hard for the speed this whole port is for.
+opt-level = 3
+lto = true
+codegen-units = 1

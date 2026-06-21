@@ -7,3 +7,4 @@ plot/
 simulation/
 notebooks/.ipynb_checkpoints/
 *.egg-info
+rust/target/

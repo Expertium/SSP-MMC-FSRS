@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ssp-mmc-rust"
+version = "0.1.0"
+description = "Rust port of the SSP-MMC-FSRS simulator (for speed)."
+requires-python = ">=3.13"
+
+[tool.maturin]
+# Pure Rust extension module (no extra Python source alongside it).
+features = ["pyo3/extension-module"]

@@ -17,6 +17,7 @@ from .config import (
     S_MIN,
 )
 from .core import power_forgetting_curve_torch
+from . import shared_rng
 
 
 def _call_policy_with_fallback(
@@ -74,7 +75,10 @@ def simulate(
     seed=42,
     s_max=math.inf,
     progress_desc=None,
+    rng_kind="torch",
 ):
+    if rng_kind not in ("torch", "shared"):
+        raise ValueError(f"Unknown rng_kind: {rng_kind!r} (use 'torch' or 'shared')")
     torch.manual_seed(seed)
     np.random.seed(seed)
     due = torch.full(
@@ -90,7 +94,13 @@ def simulate(
     last_date = torch.zeros_like(due)
     ivl = torch.zeros_like(due, dtype=torch.float32)
     cost = torch.zeros_like(due)
-    ratings_np = np.random.choice([1, 2, 3, 4], deck_size, p=first_rating_prob)
+    if rng_kind == "torch":
+        ratings_np = np.random.choice([1, 2, 3, 4], deck_size, p=first_rating_prob)
+    else:  # "shared": counter-based per-(deck, card) draw — see shared_rng / rng.rs
+        u = shared_rng.uniform_block(
+            shared_rng.KIND_INIT_RATING, 0, parallel, deck_size, learn_span, seed
+        )
+        ratings_np = shared_rng.categorical(u, first_rating_prob) + 1
     rating = torch.tensor(ratings_np, dtype=torch.int32, device=device)
     review_cnt_per_day = torch.zeros((parallel, learn_span), device=device)
     learn_cnt_per_day = torch.zeros_like(review_cnt_per_day)
@@ -165,12 +175,33 @@ def simulate(
         )
         cost.zero_()
         need_review = due <= today
-        rand = torch.rand(need_review.shape, device=device)
+        if rng_kind == "torch":
+            rand = torch.rand(need_review.shape, device=device)
+        else:  # "shared"
+            u = shared_rng.uniform_block(
+                shared_rng.KIND_FORGET, today, parallel, deck_size, learn_span, seed
+            )
+            rand = torch.tensor(u, dtype=torch.float64, device=device)
         forget = rand > retrievability
         rating = torch.where(need_review & forget, 1, rating)
-        ratings_ind_sample = torch.multinomial(
-            weights_tensor, num_samples=due.numel(), replacement=True
-        ).view_as(due)
+        if rng_kind == "torch":
+            ratings_ind_sample = torch.multinomial(
+                weights_tensor, num_samples=due.numel(), replacement=True
+            ).view_as(due)
+        else:  # "shared"
+            u = shared_rng.uniform_block(
+                shared_rng.KIND_PASS_RATING,
+                today,
+                parallel,
+                deck_size,
+                learn_span,
+                seed,
+            )
+            ratings_ind_sample = torch.tensor(
+                shared_rng.categorical(u, review_rating_prob),
+                dtype=torch.int64,
+                device=device,
+            )
         ratings_sample = pass_ratings_tensor[ratings_ind_sample]
         rating = torch.where(need_review & ~forget, ratings_sample, rating)
         cost = torch.where(~need_review, cost, review_costs_tensor[rating - 1])
