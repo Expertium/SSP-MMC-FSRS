@@ -48,9 +48,11 @@ def cargo_build():
     env = os.environ.copy()
     env["PYO3_PYTHON"] = str(VENV_PY)
     env["CARGO_BUILD_JOBS"] = "1"
+    # cwd=rust/ so cargo picks up rust/.cargo/config.toml (config is discovered from the
+    # working dir upward, not the manifest dir).
     r = subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml")],
-        cwd=ROOT,
+        ["cargo", "build", "--release"],
+        cwd=ROOT / "rust",
         env=env,
     )
     if r.returncode != 0:
@@ -66,13 +68,15 @@ def build_to(dirpath):
 def build_variants():
     """Return (before_dir, after_dir). before=HEAD via git stash; after=working tree."""
     before_dir, after_dir = BUILD / "before", BUILD / "after"
-    changed = _run(["git", "diff", "--quiet", "--", "rust"]).returncode != 0
+    # porcelain catches untracked files too (e.g. a new rust/.cargo/config.toml), which
+    # `git diff` would miss; gitignored paths (rust/target) are excluded by default.
+    changed = _run(["git", "status", "--porcelain", "--", "rust"]).stdout.strip() != ""
     if not changed:
         print("rust/ unchanged -> before == after (baseline run)")
         build_to(after_dir)
         return after_dir, after_dir
     print("stashing rust/ to build `before` from HEAD ...")
-    if _run(["git", "stash", "push", "--", "rust"]).returncode != 0:
+    if _run(["git", "stash", "push", "--include-untracked", "--", "rust"]).returncode != 0:
         sys.exit("git stash failed")
     try:
         build_to(before_dir)
