@@ -7,6 +7,7 @@
 use pyo3::prelude::*;
 
 mod rng;
+mod simulate;
 
 /// Return the crate version. Trivial smoke-test that the module imports and calls.
 #[pyfunction]
@@ -25,5 +26,6 @@ fn ssp_mmc_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(add, m)?)?;
     m.add_function(wrap_pyfunction!(rng::rng_uniforms, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate::simulate, m)?)?;
     Ok(())
 }
