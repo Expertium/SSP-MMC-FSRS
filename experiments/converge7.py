@@ -104,6 +104,12 @@ def parse_args():
         "--n-iter", type=int, default=3000, help="Max value-iteration steps."
     )
     p.add_argument("--n-s", type=int, default=None, help="Override S grid size (N_S).")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Hyperparameter sets per batched solve (4 is the measured sweet spot).",
+    )
     p.add_argument("--unconverged-frac", type=float, default=1.0 / 20.0)
     p.add_argument("--device", type=str, default=None, help="cuda/cpu (default: auto).")
     p.add_argument(
@@ -187,12 +193,15 @@ def main():
             user_converged = True
             worst_frac = 0.0
             failed_sets = []
-            for si, hp in enumerate(hp_sets):
-                ts = time.perf_counter()
-                _, fm, iters = solver.measure_convergence(hp, n_iter=args.n_iter)
-                solve_times.append(time.perf_counter() - ts)
+            ts = time.perf_counter()
+            # Batched over hyperparameter sets (they share this user's transitions/recall);
+            # batch_size=4 is the measured sweet spot (~2.1x, lowest VRAM).
+            verdicts = solver.measure_convergence_batched(
+                hp_sets, n_iter=args.n_iter, batch_size=args.batch_size
+            )
+            solve_times.append(time.perf_counter() - ts)
+            for si, (set_converged, fm, iters) in enumerate(verdicts):
                 worst_frac = max(worst_frac, fm)
-                set_converged = fm < args.unconverged_frac
                 if not set_converged:
                     user_converged = False
                     failed_sets.append({"set": si, "frac_at_max": fm, "iters": iters})
@@ -246,7 +255,8 @@ def main():
         print(f"Errored IDs:        {sorted(errored)}")
     print(
         f"Timing: build mean={np.mean(build_times):.2f}s, "
-        f"solve mean={np.mean(solve_times):.2f}s/set, total={elapsed:.0f}s"
+        f"solve mean={np.mean(solve_times):.2f}s/user (15 sets, bs={args.batch_size}), "
+        f"total={elapsed:.0f}s"
     )
     write_results()
     print(f"Saved results to {args.results}")

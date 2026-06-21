@@ -98,6 +98,65 @@ if HAS_TRITON:
         s_old = tl.load(state_ptr + s)
         tl.store(new_state_ptr + s, tl.minimum(s_old, row_min))
 
+    @triton.jit
+    def _bellman_step_kernel_batched(
+        state_ptr,  # (B, n_states) flat: state[b*n_states + s]
+        const_cost_ptr,  # (B, n_states, r_size) flat
+        r_pred_ptr,  # (n_states, r_size) SHARED across sets
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,  # (n_states, r_size) int32 SHARED across sets
+        new_state_ptr,  # (B, n_states)
+        n_states,
+        r_size,
+        n_sets,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+        B_BLOCK: tl.constexpr,
+        R_BLOCK: tl.constexpr,
+    ):
+        """Bellman backup for one state across a tile of B_BLOCK hyperparameter sets.
+
+        The sets share the same user, hence the same transitions ``t0..t3`` and recall
+        ``r_pred`` -- loaded ONCE per program and reused across the whole set tile (that
+        reuse, vs re-reading the ~1 GB transition tables once per set, is the point). Only
+        ``const_cost`` and ``state`` differ per set.
+        """
+        s = tl.program_id(0)
+        b = tl.arange(0, B_BLOCK)
+        r = tl.arange(0, R_BLOCK)
+        b_mask = b < n_sets
+        r_mask = r < r_size
+        mask2 = b_mask[:, None] & r_mask[None, :]
+
+        shared_off = s * r_size + r  # (R_BLOCK,)
+        rp = tl.load(r_pred_ptr + shared_off, mask=r_mask, other=0.0)
+        i0 = tl.load(t0_ptr + shared_off, mask=r_mask, other=0)
+        i1 = tl.load(t1_ptr + shared_off, mask=r_mask, other=0)
+        i2 = tl.load(t2_ptr + shared_off, mask=r_mask, other=0)
+        i3 = tl.load(t3_ptr + shared_off, mask=r_mask, other=0)
+
+        base_b = b[:, None] * n_states  # (B_BLOCK, 1) per-set state offset
+        cc_off = (b[:, None] * n_states + s) * r_size + r[None, :]
+        cc = tl.load(const_cost_ptr + cc_off, mask=mask2, other=float("inf"))
+        v0 = tl.load(state_ptr + base_b + i0[None, :], mask=mask2, other=0.0)
+        v1 = tl.load(state_ptr + base_b + i1[None, :], mask=mask2, other=0.0)
+        v2 = tl.load(state_ptr + base_b + i2[None, :], mask=mask2, other=0.0)
+        v3 = tl.load(state_ptr + base_b + i3[None, :], mask=mask2, other=0.0)
+
+        rp2 = rp[None, :]
+        av = cc + discount * (
+            (1.0 - rp2) * v0 + rp2 * rrp0 * v1 + rp2 * rrp1 * v2 + rp2 * rrp2 * v3
+        )
+        av = tl.where(mask2, av, float("inf"))
+        row_min = tl.min(av, axis=1)  # (B_BLOCK,) min over actions per set
+        s_off = b * n_states + s
+        s_old = tl.load(state_ptr + s_off, mask=b_mask, other=float("inf"))
+        tl.store(new_state_ptr + s_off, tl.minimum(s_old, row_min), mask=b_mask)
+
 
 # ── Grid constants (FSRS-7) ──────────────────────────────────────────────────
 S_MIN = 1e-4  # FSRS-7 --secs stability floor
@@ -455,6 +514,76 @@ class SSPMMCSolver7:
             actual_max = state.max()
             frac = float((state == actual_max).sum().item()) / state.numel()
         return frac < (1.0 / 20.0), frac, it
+
+    def measure_convergence_batched(
+        self, hp_list, n_iter=3000, convergence_tol=0.1, batch_size=8
+    ):
+        """Convergence verdicts for a LIST of hyperparameter sets, processing ``batch_size``
+        at a time through the batched kernel so the per-user transitions/recall are read
+        once and reused across the group. Returns ``[(converged, frac, iters), ...]`` aligned
+        with ``hp_list``. Falls back to per-set ``measure_convergence`` without Triton."""
+        if not self._use_triton():
+            return [
+                self.measure_convergence(hp, n_iter, convergence_tol) for hp in hp_list
+            ]
+        out = []
+        for start in range(0, len(hp_list), batch_size):
+            out.extend(
+                self._measure_convergence_group(
+                    hp_list[start : start + batch_size], n_iter, convergence_tol
+                )
+            )
+        return out
+
+    def _measure_convergence_group(self, group, n_iter, convergence_tol):
+        b = len(group)
+        n_states, r_size = self.n_states, self.r_size
+        rrp = self.review_rating_prob
+        rrp0, rrp1, rrp2 = float(rrp[0]), float(rrp[1]), float(rrp[2])
+        t0, t1, t2, t3 = self._transitions
+        b_block = triton.next_power_of_2(b)
+        r_block = triton.next_power_of_2(r_size)
+        grid = (n_states,)
+        with torch.inference_mode():
+            const_cost = torch.stack(
+                [self._const_cost(hp) for hp in group], dim=0
+            ).contiguous()  # (b, n_states, r_size)
+            state = self._state_init.unsqueeze(0).repeat(b, 1).contiguous()
+            new_state = torch.empty_like(state)
+            it = 0
+            cost_diff = 1e9
+            while it < n_iter and cost_diff > convergence_tol:
+                it += 1
+                _bellman_step_kernel_batched[grid](
+                    state,
+                    const_cost,
+                    self._r_pred_flat,
+                    t0,
+                    t1,
+                    t2,
+                    t3,
+                    new_state,
+                    n_states,
+                    r_size,
+                    b,
+                    rrp0,
+                    rrp1,
+                    rrp2,
+                    DISCOUNT_FACTOR,
+                    B_BLOCK=b_block,
+                    R_BLOCK=r_block,
+                )
+                check_interval = 10 if it <= 100 else 25
+                if it % check_interval == 0:
+                    cost_diff = (state - new_state).max().item()
+                state, new_state = new_state, state
+            results = []
+            for i in range(b):
+                sb = state[i]
+                m = sb.max()
+                frac = float((sb == m).sum().item()) / sb.numel()
+                results.append((frac < (1.0 / 20.0), frac, it))
+        return results
 
     def solve(self, hyperparams, n_iter=100_000, convergence_tol=0.1, verbose=True):
         """Run value iteration; return ``(cost_matrix, retention_matrix)`` as numpy arrays
