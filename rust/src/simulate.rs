@@ -17,6 +17,7 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::fastmath;
 use crate::rng;
 
 const S_MIN: f64 = 0.1;
@@ -175,15 +176,15 @@ pub fn simulate<'py>(
 
         // interval to (just past) policy_s_max at rating 3 -> ceil; shared by fixed/dr/memrise/sm2
         let int_req = |s: f64, d: f64| -> f64 {
-            let c_coef = exp_w8 * (11.0 - d) * s.powf(-w9);
+            let c_coef = exp_w8 * (11.0 - d) * fastmath::pow(s, -w9);
             let s_next = policy_s_max + 1e-3;
-            let max_r = (1.0 - ((s_next / s - 1.0) / c_coef + 1.0).ln() / w10).max(0.01);
-            let ivl_raw = s / fc_factor * (max_r.powf(1.0 / decay) - 1.0);
+            let max_r = (1.0 - fastmath::ln((s_next / s - 1.0) / c_coef + 1.0) / w10).max(0.01);
+            let ivl_raw = s / fc_factor * (fastmath::pow(max_r, 1.0 / decay) - 1.0);
             ivl_raw.ceil().max(1.0)
         };
         // DR base interval: interval to reach desired retention -> floor
         let ni_floor = |s: f64, r: f64| -> f64 {
-            (s / fc_factor * (r.powf(1.0 / decay) - 1.0))
+            (s / fc_factor * (fastmath::pow(r, 1.0 / decay) - 1.0))
                 .floor()
                 .max(1.0)
         };
@@ -223,7 +224,7 @@ pub fn simulate<'py>(
                 if stability[c] > STABILITY_INIT {
                     delta_t[c] = today_f - last_date[c];
                     let dt = delta_t[c] as f64;
-                    retriev[c] = (1.0 + fc_factor * dt / stability[c]).powf(decay);
+                    retriev[c] = fastmath::pow(1.0 + fc_factor * dt / stability[c], decay);
                 }
             }
 
@@ -273,9 +274,9 @@ pub fn simulate<'py>(
                 let rt = rating[c];
                 let s_new = if forget[c] {
                     let t1 = w11
-                        * d.powf(-w12)
-                        * ((s + 1.0).powf(w13) - 1.0)
-                        * (((1.0 - r) * w14).exp());
+                        * fastmath::pow(d, -w12)
+                        * (fastmath::pow(s + 1.0, w13) - 1.0)
+                        * fastmath::exp((1.0 - r) * w14);
                     t1.min(s / fail_div)
                 } else {
                     let hp = if rt == 2 { w15 } else { 1.0 };
@@ -283,8 +284,8 @@ pub fn simulate<'py>(
                     s * (1.0
                         + exp_w8
                             * (11.0 - d)
-                            * s.powf(-w9)
-                            * (((1.0 - r) * w10).exp() - 1.0)
+                            * fastmath::pow(s, -w9)
+                            * (fastmath::exp((1.0 - r) * w10) - 1.0)
                             * hp
                             * eb)
                 };
@@ -329,7 +330,7 @@ pub fn simulate<'py>(
                 last_date[c] = today_f;
                 let rt = rating[c];
                 stability[c] = init_s[(rt - 1) as usize].clamp(S_MIN, sim_s_max);
-                let id = w4 - (w5 * (rt as f64 - 1.0)).exp() + 1.0;
+                let id = w4 - fastmath::exp(w5 * (rt as f64 - 1.0)) + 1.0;
                 difficulty[c] = (id - w6 * fro[(rt - 1) as usize]).clamp(1.0, 10.0) as f32;
             }
 

@@ -6,6 +6,7 @@
 
 use pyo3::prelude::*;
 
+mod fastmath;
 mod rng;
 mod simulate;
 
