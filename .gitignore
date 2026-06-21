@@ -8,3 +8,4 @@ simulation/
 notebooks/.ipynb_checkpoints/
 *.egg-info
 rust/target/
+bench/_build/
