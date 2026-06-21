@@ -9,3 +9,4 @@ Workload: 50 users x DR [0.7, 0.9, 0.99], parallel=1, deck=10000, span=1825, see
 | 2026-06-21 19:39:05 | 2 | 1.274x | 3.72e-23 | 0.000/0.001 | 0.000/0.038 | PASS | PASS | PASS | PASS | ACCEPT | fast approximate transcendentals (exp2/log2-based pow/exp/ln) on the per-card hot path |
 | 2026-06-21 19:53:40 | 3 | 1.362x | 1.15e-26 | 0.000/0.001 | 0.000/0.038 | PASS | PASS | PASS | PASS | ACCEPT | target-cpu=native (AVX2+FMA via rust/.cargo/config.toml) |
 | 2026-06-21 20:07:03 | 4 | 1.173x | 1.15e-26 | 0.008/0.350 | 0.021/0.214 | PASS | PASS | PASS | PASS | ACCEPT | cruder fastmath polynomials (exp2 degree-5, log2 3-term) |
+| 2026-06-21 20:19:22 | 5 | 0.604x | 1.0000 | 0.008/0.350 | 0.021/0.214 | FAIL | FAIL | PASS | PASS | REJECT | fuse retrievability into the draw pass (one fewer full-deck pass, bit-identical) |
