@@ -144,52 +144,86 @@ def main():
 
     results = {}
     unconverged = []
+    errored = []
     build_times, solve_times = [], []
     t_start = time.perf_counter()
 
+    def write_results():
+        # Incremental save after every user so a crash never loses the whole run.
+        args.results.parent.mkdir(parents=True, exist_ok=True)
+        tmp = args.results.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "n_users_target": n,
+                    "n_users_done": len(results),
+                    "n_iter": args.n_iter,
+                    "n_s": args.n_s,
+                    "unconverged_users": sorted(unconverged),
+                    "errored_users": sorted(errored),
+                    "results": {str(k): v for k, v in results.items()},
+                    "hyperparam_sets": hp_sets,
+                },
+                fh,
+                indent=2,
+            )
+        tmp.replace(args.results)
+
     for ui, user_id in enumerate(user_ids, 1):
-        w = params[user_id]["parameters"]["0"]
-        u = usage[user_id]
-        tb = time.perf_counter()
-        solver = SSPMMCSolver7(
-            review_costs=u["review_costs"],
-            first_rating_prob=u["first_rating_prob"],
-            review_rating_prob=u["review_rating_prob"],
-            w=w,
-            device=device,
-            **n_s_kw,
-        )
-        build_times.append(time.perf_counter() - tb)
+        try:
+            w = params[user_id]["parameters"]["0"]
+            u = usage[user_id]
+            tb = time.perf_counter()
+            solver = SSPMMCSolver7(
+                review_costs=u["review_costs"],
+                first_rating_prob=u["first_rating_prob"],
+                review_rating_prob=u["review_rating_prob"],
+                w=w,
+                device=device,
+                **n_s_kw,
+            )
+            build_times.append(time.perf_counter() - tb)
 
-        user_converged = True
-        worst_frac = 0.0
-        for si, hp in enumerate(hp_sets):
-            ts = time.perf_counter()
-            _, fm, iters = solver.measure_convergence(hp, n_iter=args.n_iter)
-            solve_times.append(time.perf_counter() - ts)
-            worst_frac = max(worst_frac, fm)
-            set_converged = fm < args.unconverged_frac
-            if not set_converged:
-                user_converged = False
-            if args.calibrate:
-                print(
-                    f"  user {user_id} set {si:2d}: frac_at_max={fm:.4%} "
-                    f"iters={iters} {'OK' if set_converged else 'NOT CONVERGED'}"
-                )
+            user_converged = True
+            worst_frac = 0.0
+            failed_sets = []
+            for si, hp in enumerate(hp_sets):
+                ts = time.perf_counter()
+                _, fm, iters = solver.measure_convergence(hp, n_iter=args.n_iter)
+                solve_times.append(time.perf_counter() - ts)
+                worst_frac = max(worst_frac, fm)
+                set_converged = fm < args.unconverged_frac
+                if not set_converged:
+                    user_converged = False
+                    failed_sets.append({"set": si, "frac_at_max": fm, "iters": iters})
+                if args.calibrate:
+                    print(
+                        f"  user {user_id} set {si:2d}: frac_at_max={fm:.4%} "
+                        f"iters={iters} {'OK' if set_converged else 'NOT CONVERGED'}"
+                    )
 
-        results[user_id] = {
-            "converged": user_converged,
-            "worst_frac_at_max": worst_frac,
-        }
-        if not user_converged:
-            unconverged.append(user_id)
+            results[user_id] = {
+                "converged": user_converged,
+                "worst_frac_at_max": worst_frac,
+                "failed_sets": failed_sets,
+            }
+            if not user_converged:
+                unconverged.append(user_id)
 
-        # Free GPU memory between users.
-        del solver
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            del solver
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        except Exception as exc:  # one bad user must not kill a multi-hour run
+            errored.append(user_id)
+            results[user_id] = {"converged": None, "error": repr(exc)[:200]}
+            print(f"[{ui}/{n}] user {user_id}: ERROR {repr(exc)[:160]}")
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            write_results()
+            continue
 
-        conv_count = sum(1 for r in results.values() if r["converged"])
+        write_results()
+        conv_count = sum(1 for r in results.values() if r.get("converged") is True)
         print(
             f"[{ui}/{n}] user {user_id}: "
             f"{'CONVERGED' if user_converged else 'UNCONVERGED'} "
@@ -199,30 +233,22 @@ def main():
 
     elapsed = time.perf_counter() - t_start
     n_unconv = len(unconverged)
+    n_err = len(errored)
     print("\n==== FSRS-7 convergence sweep complete ====")
     print(f"Users tested:       {n}")
-    print(f"Converged:          {n - n_unconv} ({(n - n_unconv) / n:.1%})")
-    print(f"Unconverged:        {n_unconv} ({n_unconv / n:.1%})")
-    print(f"Unconverged IDs:    {unconverged}")
+    print(
+        f"Converged:          {n - n_unconv - n_err} ({(n - n_unconv - n_err) / n:.2%})"
+    )
+    print(f"Unconverged:        {n_unconv} ({n_unconv / n:.2%})")
+    print(f"Errored:            {n_err}")
+    print(f"Unconverged IDs:    {sorted(unconverged)}")
+    if errored:
+        print(f"Errored IDs:        {sorted(errored)}")
     print(
         f"Timing: build mean={np.mean(build_times):.2f}s, "
         f"solve mean={np.mean(solve_times):.2f}s/set, total={elapsed:.0f}s"
     )
-
-    args.results.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.results, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "n_users": n,
-                "n_iter": args.n_iter,
-                "n_s": args.n_s,
-                "unconverged_users": unconverged,
-                "results": {str(k): v for k, v in results.items()},
-                "hyperparam_sets": hp_sets,
-            },
-            fh,
-            indent=2,
-        )
+    write_results()
     print(f"Saved results to {args.results}")
 
 
