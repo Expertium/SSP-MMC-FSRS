@@ -87,6 +87,30 @@ def load_jsonl_by_user(path):
     return out
 
 
+def invalid_data_reason(usage_entry, w):
+    """Return a reason string if this user's inputs are unusable (NaN/inf probs or costs,
+    all-zero review costs, rating probs that don't sum to ~1, NaN params), else None. Such
+    users are a DATA-quality issue (too few reviews to estimate stats), not a solver-
+    convergence question, so the sweep skips them rather than flagging them unconverged."""
+    arr = np.asarray
+    for key in (
+        "review_costs",
+        "learn_costs",
+        "first_rating_prob",
+        "review_rating_prob",
+    ):
+        v = arr(usage_entry[key], dtype=float)
+        if not np.all(np.isfinite(v)):
+            return f"{key}_nonfinite"
+    if float(np.sum(usage_entry["review_costs"])) <= 0:
+        return "review_costs_zero"
+    if abs(float(np.sum(usage_entry["review_rating_prob"])) - 1.0) > 0.05:
+        return "review_rating_prob_sum"
+    if not np.all(np.isfinite(arr(w, dtype=float))):
+        return "w_nonfinite"
+    return None
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="FSRS-7 Bellman convergence sweep (step 3)."
@@ -151,6 +175,7 @@ def main():
     results = {}
     unconverged = []
     errored = []
+    invalid = []
     build_times, solve_times = [], []
     t_start = time.perf_counter()
 
@@ -167,6 +192,7 @@ def main():
                     "n_s": args.n_s,
                     "unconverged_users": sorted(unconverged),
                     "errored_users": sorted(errored),
+                    "invalid_data_users": sorted(invalid),
                     "results": {str(k): v for k, v in results.items()},
                     "hyperparam_sets": hp_sets,
                 },
@@ -179,6 +205,13 @@ def main():
         try:
             w = params[user_id]["parameters"]["0"]
             u = usage[user_id]
+            reason = invalid_data_reason(u, w)
+            if reason is not None:
+                invalid.append(user_id)
+                results[user_id] = {"converged": None, "invalid_data": reason}
+                print(f"[{ui}/{n}] user {user_id}: SKIP invalid data ({reason})")
+                write_results()
+                continue
             tb = time.perf_counter()
             solver = SSPMMCSolver7(
                 review_costs=u["review_costs"],
@@ -243,16 +276,24 @@ def main():
     elapsed = time.perf_counter() - t_start
     n_unconv = len(unconverged)
     n_err = len(errored)
+    n_inv = len(invalid)
+    # Convergence rate is over VALID, non-errored users (invalid-data users excluded).
+    n_valid = n - n_inv - n_err
     print("\n==== FSRS-7 convergence sweep complete ====")
     print(f"Users tested:       {n}")
-    print(
-        f"Converged:          {n - n_unconv - n_err} ({(n - n_unconv - n_err) / n:.2%})"
-    )
-    print(f"Unconverged:        {n_unconv} ({n_unconv / n:.2%})")
+    print(f"Invalid-data (skipped): {n_inv}")
     print(f"Errored:            {n_err}")
+    print(f"Valid users:        {n_valid}")
+    rate = (n_valid - n_unconv) / n_valid if n_valid else 0.0
+    print(f"Converged:          {n_valid - n_unconv} ({rate:.2%} of valid)")
+    print(
+        f"Unconverged:        {n_unconv} ({n_unconv / n_valid if n_valid else 0:.2%} of valid)"
+    )
     print(f"Unconverged IDs:    {sorted(unconverged)}")
     if errored:
         print(f"Errored IDs:        {sorted(errored)}")
+    if invalid:
+        print(f"Invalid-data IDs:   {sorted(invalid)}")
     print(
         f"Timing: build mean={np.mean(build_times):.2f}s, "
         f"solve mean={np.mean(solve_times):.2f}s/user (15 sets, bs={args.batch_size}), "
