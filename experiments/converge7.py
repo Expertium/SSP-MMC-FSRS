@@ -176,6 +176,26 @@ def main():
     unconverged = []
     errored = []
     invalid = []
+    # Resume: if the results file exists, skip users already done (so a crash/restart picks
+    # up where it left off). A user that crashed hard mid-solve was never recorded, so it is
+    # NOT in `results` and gets retried.
+    if args.results.exists():
+        try:
+            prev = json.loads(args.results.read_text(encoding="utf-8"))
+            results = {int(k): v for k, v in prev.get("results", {}).items()}
+            unconverged = list(prev.get("unconverged_users", []))
+            errored = list(prev.get("errored_users", []))
+            invalid = list(prev.get("invalid_data_users", []))
+            done = set(results)
+            before = len(user_ids)
+            user_ids = [u for u in user_ids if u not in done]
+            print(
+                f"Resuming from {args.results}: {len(done)} done, "
+                f"{len(user_ids)} of {before} remaining"
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Could not resume from {args.results} ({exc}); starting fresh.")
+
     build_times, solve_times = [], []
     t_start = time.perf_counter()
 
@@ -209,7 +229,9 @@ def main():
             if reason is not None:
                 invalid.append(user_id)
                 results[user_id] = {"converged": None, "invalid_data": reason}
-                print(f"[{ui}/{n}] user {user_id}: SKIP invalid data ({reason})")
+                print(
+                    f"[{len(results)}/{n}] user {user_id}: SKIP invalid data ({reason})"
+                )
                 write_results()
                 continue
             tb = time.perf_counter()
@@ -258,7 +280,7 @@ def main():
         except Exception as exc:  # one bad user must not kill a multi-hour run
             errored.append(user_id)
             results[user_id] = {"converged": None, "error": repr(exc)[:200]}
-            print(f"[{ui}/{n}] user {user_id}: ERROR {repr(exc)[:160]}")
+            print(f"[{len(results)}/{n}] user {user_id}: ERROR {repr(exc)[:160]}")
             if device == "cuda":
                 torch.cuda.empty_cache()
             write_results()
@@ -267,10 +289,10 @@ def main():
         write_results()
         conv_count = sum(1 for r in results.values() if r.get("converged") is True)
         print(
-            f"[{ui}/{n}] user {user_id}: "
+            f"[{len(results)}/{n}] user {user_id}: "
             f"{'CONVERGED' if user_converged else 'UNCONVERGED'} "
             f"(worst frac_at_max={worst_frac:.3%})  |  running rate: "
-            f"{conv_count}/{ui} = {conv_count / ui:.1%}"
+            f"{conv_count}/{len(results)} = {conv_count / max(len(results), 1):.1%}"
         )
 
     elapsed = time.perf_counter() - t_start
