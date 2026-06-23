@@ -209,6 +209,8 @@ class SSPMMCSolver7:
         n_s=N_S,
         dtype=torch.float32,
         engine="auto",
+        d_state=None,
+        s_state=None,
     ):
         # Per-user inputs (CLAUDE.md: per-user FSRS params + per-button costs + H/G/E probs).
         self.review_costs = np.asarray(review_costs, dtype=np.float64)
@@ -220,6 +222,16 @@ class SSPMMCSolver7:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.n_s = n_s
+        # Optional non-uniform difficulty grid (e.g. fine at the extremes, coarse in the
+        # flat middle). None -> the default uniform D_EPS grid.
+        self._custom_d_state = (
+            np.asarray(d_state, dtype=np.float64) if d_state is not None else None
+        )
+        # Optional custom S grid (e.g. non-uniform log spacing). None -> the default
+        # log-uniform build_s_grid(n_s). Must be sorted and span [S_MIN, S_MAX].
+        self._custom_s_state = (
+            np.asarray(s_state, dtype=np.float64) if s_state is not None else None
+        )
         # Value-iteration engine: "auto" (Triton kernel on CUDA, else eager), or force
         # "triton"/"eager" -- used to cross-check the fused kernel against eager.
         assert engine in ("auto", "triton", "eager")
@@ -230,12 +242,24 @@ class SSPMMCSolver7:
     # ── grids ────────────────────────────────────────────────────────────────
     def _init_state_spaces(self):
         self.s_min, self.s_max = S_MIN, S_MAX
-        self.s_state = build_s_grid(self.s_min, self.s_max, self.n_s)
+        if self._custom_s_state is not None:
+            self.s_state = self._custom_s_state
+        else:
+            self.s_state = build_s_grid(self.s_min, self.s_max, self.n_s)
         self.s_size = len(self.s_state)
 
-        self.d_min, self.d_max, self.d_eps = D_MIN, D_MAX, D_EPS
-        self.d_size = int(np.ceil((self.d_max - self.d_min) / self.d_eps + 1))
-        self.d_state = np.linspace(self.d_min, self.d_max, self.d_size)
+        if self._custom_d_state is not None:
+            self.d_state = self._custom_d_state
+            self.d_min = float(self.d_state[0])
+            self.d_max = float(self.d_state[-1])
+            self.d_eps = None
+            self.d_size = len(self.d_state)
+            self._d_uniform = False
+        else:
+            self.d_min, self.d_max, self.d_eps = D_MIN, D_MAX, D_EPS
+            self.d_size = int(np.ceil((self.d_max - self.d_min) / self.d_eps + 1))
+            self.d_state = np.linspace(self.d_min, self.d_max, self.d_size)
+            self._d_uniform = True
 
         self.r_min, self.r_max, self.r_eps = R_MIN, R_MAX, R_EPS
         self.r_size = int(np.ceil((self.r_max - self.r_min) / self.r_eps + 1))
@@ -246,6 +270,9 @@ class SSPMMCSolver7:
         self._s_state_t = torch.as_tensor(
             self.s_state, device=self.device, dtype=self.dtype
         )
+        self._d_state_t = torch.as_tensor(
+            self.d_state, device=self.device, dtype=self.dtype
+        )
         self._w_t = torch.as_tensor(self.w, device=self.device, dtype=self.dtype)
 
     # ── index maps ─────────────────────────────────────────────────────────────
@@ -255,19 +282,32 @@ class SSPMMCSolver7:
         return idx.clamp_(0, self.s_size - 1)
 
     def d2i_torch(self, d):
-        idx = torch.floor(
-            (d - self.d_min) / (self.d_max - self.d_min) * self.d_size
-        ).to(torch.long)
-        return idx.clamp_(0, self.d_size - 1)
+        if self._d_uniform:
+            idx = torch.floor(
+                (d - self.d_min) / (self.d_max - self.d_min) * self.d_size
+            ).to(torch.long)
+            return idx.clamp_(0, self.d_size - 1)
+        # Non-uniform grid: nearest grid point.
+        dv = d.to(self.dtype).contiguous()
+        hi = torch.searchsorted(self._d_state_t, dv).clamp(0, self.d_size - 1)
+        lo = (hi - 1).clamp(0, self.d_size - 1)
+        pick_hi = (self._d_state_t[hi] - dv).abs() <= (dv - self._d_state_t[lo]).abs()
+        return torch.where(pick_hi, hi, lo)
 
     def s2i(self, s):
         return np.clip(np.searchsorted(self.s_state, s), 0, self.s_size - 1)
 
     def d2i(self, d):
-        idx = np.floor(
-            (d - self.d_min) / (self.d_max - self.d_min) * self.d_size
-        ).astype(int)
-        return np.clip(idx, 0, self.d_size - 1)
+        if self._d_uniform:
+            idx = np.floor(
+                (d - self.d_min) / (self.d_max - self.d_min) * self.d_size
+            ).astype(int)
+            return np.clip(idx, 0, self.d_size - 1)
+        d = np.asarray(d, dtype=float)
+        hi = np.clip(np.searchsorted(self.d_state, d), 0, self.d_size - 1)
+        lo = np.clip(hi - 1, 0, self.d_size - 1)
+        pick_hi = np.abs(self.d_state[hi] - d) <= np.abs(d - self.d_state[lo])
+        return np.where(pick_hi, hi, lo)
 
     def _flat_index(self, d_idx, sl_idx, ss_idx):
         return (d_idx * self.s_size + sl_idx) * self.s_size + ss_idx
