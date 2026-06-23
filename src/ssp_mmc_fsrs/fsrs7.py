@@ -203,26 +203,86 @@ def step(delta_t, rating, s_long, s_short, d, w, s_min, s_max=S_MAX):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Interval inversion (scheduling): find t such that forgetting_curve(t, ...) = dr.
-# The dual-stability curve has no closed-form inverse, so we root-find. We use Brent's
-# method (bracketing: inverse-quadratic / secant / bisection) in log(t) space, inverting
-# the FULL forgetting_curve p (the same value the simulator uses to decide recall). Used
-# by the FSRS-7 policies (roadmap step 2c).
+# The dual-stability curve has no closed-form inverse, so we root-find. Two methods,
+# selected by ``method=`` because they target different consumers:
 #
-# Why Brent and not Newton: tests/newton_steps_study.py compares both, vectorized, against
-# a scipy.brentq golden over a grid of states x DR in [0.60, 0.99] x real param sets.
-# Brent converges to machine precision in ~1 step for the median case and reaches
-# worst-case interval error < 0.1% in 12 iterations; a safeguarded-Newton (rtsafe) variant
-# needed >20 (its steps, started from the bracket midpoint, are repeatedly rejected) AND
-# costs ~2x the transcendentals per iteration (it also needs dR/dt). So Brent is both
-# faster-converging and cheaper here.
+# * ``method="brent"`` (DEFAULT) -- vectorized Brent (inverse-quadratic / secant /
+#   bisection) in log(t). ROBUST everywhere, including the BELLMAN solver's full Cartesian
+#   grid, whose flat ill-conditioned corners (S_short at the floor -> decay1 clamps to its
+#   0.01 floor -> p drifts by ~0.005 over 4 decades of t, df -> 0) only bisection can crack.
+#   ~12 iters reaches worst-case interval error < 0.1% there. Keep this for the solver.
+#
+# * ``method="newton"`` -- weighted-geomean init (the two single-component inverses t1*, t2*)
+#   + bracket-clamped Newton in log(t). Newton's derivative reuses the SAME two pow() as the
+#   function eval, so a step costs ~one Brent f-eval but converges quadratically. For the
+#   SIMULATOR scheduling path ONLY: realistic (recurrence-generated) states are well-
+#   conditioned (decay1 floored at a realistic S_short for only ~0.3% of cases), so 7 steps
+#   give worst-case < 1e-6 over 40k realistic states from all 10k users at ~2x fewer iters
+#   than Brent-12. It is NOT safe on the full grid (Newton blows up on the flat corners).
+#
+# See tests/inverse_speedup_study.py (the head-to-head + the simulator-vs-Bellman split) and
+# tests/newton_steps_study.py (the original Brent-vs-Newton iteration-count study).
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Shortest schedulable interval: 1 minute, in days.
 MIN_INTERVAL_DAYS = 1.0 / 1440.0
 
-# Brent iterations for the interval inversion (worst-case interval error < 0.1% over
-# DR in [0.60, 0.99]; the median case is exact in 1 step). See tests/newton_steps_study.py.
+# Brent iterations for the robust inverse (worst-case interval error < 0.1% over the full
+# grid; the median case is exact in 1 step). See tests/newton_steps_study.py.
 INVERSE_N_ITER = 12
+
+# Newton iterations for the simulator-only fast inverse. 6 is the smallest with 0/40000
+# realistic cases over 0.1% (across all 10k users); 7 adds a safety-margin step
+# (worst-case ~1e-7). See tests/inverse_speedup_study.py::production_iter_scan.
+NEWTON_N_ITER = 7
+
+
+def _newton_inverse(dr, s_long, s_short, d, w, n_iter, min_t, max_t):
+    """SIMULATOR-ONLY fast inverse: weighted-geomean init + bracket-clamped Newton in
+    log(t). Vectorized mirror of the scalar candidate in tests/inverse_speedup_study.py.
+    Assumes realistic states (well-conditioned curve); see ``forgetting_curve_inverse``."""
+    decay1 = -(w[23] * s_short.pow(w[33] - 0.3)).clamp(0.01, 0.95)
+    factor1 = (w[25].log() * decay1.pow(-1.0)).clamp(max=60.0).exp() - 1.0
+    a1 = factor1 / s_short
+
+    decay2 = -w[24].clamp(0.01, 0.95)
+    factor2 = w[26].pow(decay2.pow(-1.0)) - 1.0
+    d_timescale = ((d - 5.0) * (w[32] - 0.3)).exp()
+    a2 = factor2 * d_timescale / s_long
+
+    weight1 = w[27] * s_short.pow(-w[29])
+    weight2 = w[28] * s_long.pow(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp()
+    wt_sum = (weight1 + weight2).clamp(min=1e-9)
+    scale = 1.0 - 2e-5
+    c1 = weight1 / wt_sum * scale
+    c2 = weight2 / wt_sum * scale
+
+    dr_t = torch.as_tensor(dr, dtype=s_long.dtype, device=s_long.device)
+    log_min = math.log(min_t)
+    log_max = math.log(max_t)
+
+    # Bracket from the single-component inverses (clamped to range), sorted lo <= hi. The
+    # weighted geomean (weight = mixture weight of the short component) seeds Newton.
+    t1 = ((dr_t.pow(1.0 / decay1) - 1.0) / a1).clamp(min=1e-12)
+    t2 = ((dr_t.pow(1.0 / decay2) - 1.0) / a2).clamp(min=1e-12)
+    u_lo = torch.minimum(t1, t2).log().clamp(log_min, log_max)
+    u_hi = torch.maximum(t1, t2).log().clamp(log_min, log_max)
+    alpha = weight1 / wt_sum
+    u = torch.minimum(torch.maximum(alpha * u_lo + (1.0 - alpha) * u_hi, u_lo), u_hi)
+
+    for _ in range(n_iter):
+        t = u.exp()
+        i1 = a1 * t + 1.0
+        i2 = a2 * t + 1.0
+        p1 = i1.pow(decay1)
+        p2 = i2.pow(decay2)
+        f = c1 * p1 + c2 * p2 + 1e-5 - dr_t
+        # dp/du = dp/dt * t; (1+a*t)^(decay-1) = p / (1+a*t), so no extra pow().
+        dfdu = (c1 * decay1 * a1 * p1 / i1 + c2 * decay2 * a2 * p2 / i2) * t
+        # Flat-region guard: where |dfdu| ~ 0 take no step (mirrors the scalar break).
+        step = torch.where(dfdu.abs() < 1e-300, torch.zeros_like(u), f / dfdu)
+        u = torch.minimum(torch.maximum(u - step, u_lo), u_hi)
+    return u.clamp(log_min, log_max).exp()
 
 
 def forgetting_curve_inverse(
@@ -231,18 +291,36 @@ def forgetting_curve_inverse(
     s_short,
     d,
     w,
-    n_iter=INVERSE_N_ITER,
+    n_iter=None,
     min_t=MIN_INTERVAL_DAYS,
     max_t=S_MAX,
+    method="brent",
 ):
-    """Interval ``t`` (days) at which the dual-stability recall probability equals ``dr``,
-    via a vectorized Brent's method in ``u = log(t)`` (classic Dekker-Brent: inverse-
-    quadratic / secant / bisection, all branch-free through torch.where). ``dr`` and the
-    state tensors are broadcastable. The root is bracketed by the two single-component
-    inverses t1* (short) and t2* (long) -- where r1, resp. r2, alone equals dr -- because
-    p is their decreasing weighted mix; clamping that bracket to ``[min_t, max_t]`` also
-    collapses an UNREACHABLE dr (root past a bound) onto that bound. Result in
-    ``[min_t, max_t]``."""
+    """Interval ``t`` (days) at which the dual-stability recall probability equals ``dr``.
+
+    ``method="brent"`` (default, robust everywhere -- use for the solver) or
+    ``method="newton"`` (fast, simulator-only). ``n_iter`` defaults to ``INVERSE_N_ITER``
+    (Brent) / ``NEWTON_N_ITER`` (Newton). See the module-level note above for the split.
+
+    Brent: vectorized Dekker-Brent in ``u = log(t)`` (inverse-quadratic / secant /
+    bisection, branch-free via torch.where). ``dr`` and the state tensors are broadcastable.
+    The root is bracketed by the two single-component inverses t1* (short) and t2* (long) --
+    where r1, resp. r2, alone equals dr -- because p is their decreasing weighted mix;
+    clamping that bracket to ``[min_t, max_t]`` also collapses an UNREACHABLE dr (root past
+    a bound) onto that bound. Result in ``[min_t, max_t]``."""
+    if method == "newton":
+        return _newton_inverse(
+            dr,
+            s_long,
+            s_short,
+            d,
+            w,
+            NEWTON_N_ITER if n_iter is None else n_iter,
+            min_t,
+            max_t,
+        )
+    if n_iter is None:
+        n_iter = INVERSE_N_ITER
     decay1 = -(w[23] * s_short.pow(w[33] - 0.3)).clamp(0.01, 0.95)
     factor1 = (w[25].log() * decay1.pow(-1.0)).clamp(max=60.0).exp() - 1.0
     a1 = factor1 / s_short

@@ -189,8 +189,7 @@ pub fn simulate<'py>(
         let int_req = |s: f32, d: f32| -> f32 {
             let c_coef = exp_w8 * (11.0 - d) * fastmath::pow_f32(s, -w9);
             let s_next = policy_s_max_f + 1e-3;
-            let max_r =
-                (1.0 - fastmath::ln_f32((s_next / s - 1.0) / c_coef + 1.0) / w10).max(0.01);
+            let max_r = (1.0 - fastmath::ln_f32((s_next / s - 1.0) / c_coef + 1.0) / w10).max(0.01);
             let ivl_raw = s / fc_factor * (fastmath::pow_f32(max_r, 1.0 / decay) - 1.0);
             ivl_raw.ceil().max(1.0)
         };

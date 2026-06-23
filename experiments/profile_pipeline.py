@@ -65,7 +65,9 @@ MAX_COST = 86400 / 2
 LEARN_LIMIT = 10
 REVIEW_LIMIT = 9999
 MAX_SAME_DAY = 8
-N_ITER = fsrs7.INVERSE_N_ITER
+# Scheduling inverse iterations passed to the Rust simulator. The Rust sim now schedules
+# with the fast Newton inverse, so this is the Newton count (matches the Python policies).
+N_ITER = fsrs7.NEWTON_N_ITER
 S_MAX = fsrs7.S_MAX
 S_MIN = S_MIN_SECS
 CUDA = torch.cuda.is_available()
@@ -99,7 +101,9 @@ def make_ssp_policy(solver, rm, w):
         pick_hi = (d_state[hi] - d).abs() <= (d - d_state[lo]).abs()
         di = torch.where(pick_hi, hi, lo)
         target = R[di, sl, ss]
-        interval = fsrs7.forgetting_curve_inverse(target, s_long, s_short, d, wt)
+        interval = fsrs7.forgetting_curve_inverse(
+            target, s_long, s_short, d, wt, method="newton"
+        )
         return interval, ease
 
     return pol

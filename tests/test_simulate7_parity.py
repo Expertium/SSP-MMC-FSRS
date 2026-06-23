@@ -80,7 +80,9 @@ LEARN_LIMIT = 10
 REVIEW_LIMIT = 9999
 MAX_SAME_DAY = 10
 S_MAX = fsrs7.S_MAX
-N_ITER = fsrs7.INVERSE_N_ITER
+# The simulator (Python create_dr_policy + the Rust sim) schedules with the fast Newton
+# inverse, so this is the Newton iteration count, matched on both sides.
+N_ITER = fsrs7.NEWTON_N_ITER
 
 
 def tile(x, parallel):

@@ -77,8 +77,9 @@ pub fn bellman_fsrs7<'py>(
                 let (sl_v, ss_v, d_v) = (sg[sl], sg[ss], dg[d]);
                 for (ri, &r) in rg.iter().enumerate() {
                     // target retention r -> interval -> achieved recall + next state per rating
-                    let t =
-                        forgetting_curve_inverse(r, sl_v, ss_v, d_v, &w, inv_n_iter, MIN_IVL, s_max);
+                    let t = forgetting_curve_inverse(
+                        r, sl_v, ss_v, d_v, &w, inv_n_iter, MIN_IVL, s_max,
+                    );
                     r_pred[st * r_size + ri] = forgetting_curve(t, sl_v, ss_v, d_v, &w);
                     for g in 1..=4i64 {
                         let (nsl, nss, nd) = update_state(t, g, sl_v, ss_v, d_v, &w, s_min, s_max);

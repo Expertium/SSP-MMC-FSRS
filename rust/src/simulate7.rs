@@ -282,6 +282,61 @@ pub(crate) fn forgetting_curve_inverse(
     b.clamp(log_min, log_max).exp()
 }
 
+/// SIMULATOR-ONLY fast inverse: weighted-geomean init + bracket-clamped Newton in log(t)
+/// (f64 mirror of fsrs7._newton_inverse). Newton's derivative reuses the same two powf()
+/// as the function eval, so a step costs ~one Brent f-eval but converges quadratically.
+/// Assumes realistic (well-conditioned) states; NOT safe on the full Bellman grid's flat
+/// corners -- the solver uses `forgetting_curve_inverse` (Brent) there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forgetting_curve_inverse_newton(
+    dr: f64,
+    s_long: f64,
+    s_short: f64,
+    d: f64,
+    w: &[f64],
+    n_iter: usize,
+    min_t: f64,
+    max_t: f64,
+) -> f64 {
+    let mag = (w[23] * s_short.powf(w[33] - 0.3)).clamp(0.01, 0.95);
+    let decay1 = -mag;
+    let factor1 = ((w[25].ln() / decay1).min(60.0)).exp() - 1.0;
+    let a1 = factor1 / s_short;
+    let decay2 = -(w[24].clamp(0.01, 0.95));
+    let factor2 = w[26].powf(1.0 / decay2) - 1.0;
+    let d_ts = ((d - 5.0) * (w[32] - 0.3)).exp();
+    let a2 = factor2 * d_ts / s_long;
+    let weight1 = w[27] * s_short.powf(-w[29]);
+    let weight2 = w[28] * s_long.powf(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp();
+    let wt_sum = (weight1 + weight2).max(1e-9);
+    let scale = 1.0 - 2e-5;
+    let c1 = weight1 / wt_sum * scale;
+    let c2 = weight2 / wt_sum * scale;
+    let log_min = min_t.ln();
+    let log_max = max_t.ln();
+
+    let t1 = ((dr.powf(1.0 / decay1) - 1.0) / a1).max(1e-12);
+    let t2 = ((dr.powf(1.0 / decay2) - 1.0) / a2).max(1e-12);
+    let u_lo = t1.min(t2).ln().clamp(log_min, log_max);
+    let u_hi = t1.max(t2).ln().clamp(log_min, log_max);
+    let alpha = weight1 / wt_sum;
+    let mut u = (alpha * u_lo + (1.0 - alpha) * u_hi).clamp(u_lo, u_hi);
+
+    for _ in 0..n_iter {
+        let t = u.exp();
+        let i1 = a1 * t + 1.0;
+        let i2 = a2 * t + 1.0;
+        let p1 = i1.powf(decay1);
+        let p2 = i2.powf(decay2);
+        let f = c1 * p1 + c2 * p2 + 1e-5 - dr;
+        // dp/du = dp/dt * t; (1+a*t)^(decay-1) = p / (1+a*t), so no extra powf().
+        let dfdu = (c1 * decay1 * a1 * p1 / i1 + c2 * decay2 * a2 * p2 / i2) * t;
+        let step = if dfdu.abs() < 1e-300 { 0.0 } else { f / dfdu };
+        u = (u - step).clamp(u_lo, u_hi);
+    }
+    u.clamp(log_min, log_max).exp()
+}
+
 // ── GRU pseudo-ground-truth recall predictor (f64 port of ssp_mmc_fsrs/gru.py) ──────
 // Per-user weights arrive as one flat row (BatchedGRU.FLAT_ORDER / FLAT_LEN). The GRU is
 // tiny (7 hidden) so a scalar f64 implementation is fastest, and it matches the Python
@@ -316,11 +371,25 @@ fn rd<const N: usize>(r: &[f64], o: &mut usize) -> [f64; N] {
 }
 
 struct GruW {
-    pre_w: [f64; 35], pre_b: [f64; 7], ln_pre: [f64; 7],
-    w_ih: [f64; 147], w_hh: [f64; 147], b_ih: [f64; 21], b_hh: [f64; 21],
-    ln_post1: [f64; 7], post_w: [f64; 49], post_b: [f64; 7], ln_post2: [f64; 7],
-    w_fc_w: [f64; 14], w_fc_b: [f64; 2], s_fc_w: [f64; 14], s_fc_b: [f64; 2],
-    d_fc_w: [f64; 14], d_fc_b: [f64; 2], input_mean: f64, input_std: f64,
+    pre_w: [f64; 35],
+    pre_b: [f64; 7],
+    ln_pre: [f64; 7],
+    w_ih: [f64; 147],
+    w_hh: [f64; 147],
+    b_ih: [f64; 21],
+    b_hh: [f64; 21],
+    ln_post1: [f64; 7],
+    post_w: [f64; 49],
+    post_b: [f64; 7],
+    ln_post2: [f64; 7],
+    w_fc_w: [f64; 14],
+    w_fc_b: [f64; 2],
+    s_fc_w: [f64; 14],
+    s_fc_b: [f64; 2],
+    d_fc_w: [f64; 14],
+    d_fc_b: [f64; 2],
+    input_mean: f64,
+    input_std: f64,
 }
 
 impl GruW {
@@ -328,14 +397,23 @@ impl GruW {
         // Fields are evaluated top-to-bottom, so the shared offset reads them in order.
         let mut o = 0usize;
         GruW {
-            pre_w: rd::<35>(r, &mut o), pre_b: rd::<7>(r, &mut o), ln_pre: rd::<7>(r, &mut o),
-            w_ih: rd::<147>(r, &mut o), w_hh: rd::<147>(r, &mut o),
-            b_ih: rd::<21>(r, &mut o), b_hh: rd::<21>(r, &mut o),
-            ln_post1: rd::<7>(r, &mut o), post_w: rd::<49>(r, &mut o),
-            post_b: rd::<7>(r, &mut o), ln_post2: rd::<7>(r, &mut o),
-            w_fc_w: rd::<14>(r, &mut o), w_fc_b: rd::<2>(r, &mut o),
-            s_fc_w: rd::<14>(r, &mut o), s_fc_b: rd::<2>(r, &mut o),
-            d_fc_w: rd::<14>(r, &mut o), d_fc_b: rd::<2>(r, &mut o),
+            pre_w: rd::<35>(r, &mut o),
+            pre_b: rd::<7>(r, &mut o),
+            ln_pre: rd::<7>(r, &mut o),
+            w_ih: rd::<147>(r, &mut o),
+            w_hh: rd::<147>(r, &mut o),
+            b_ih: rd::<21>(r, &mut o),
+            b_hh: rd::<21>(r, &mut o),
+            ln_post1: rd::<7>(r, &mut o),
+            post_w: rd::<49>(r, &mut o),
+            post_b: rd::<7>(r, &mut o),
+            ln_post2: rd::<7>(r, &mut o),
+            w_fc_w: rd::<14>(r, &mut o),
+            w_fc_b: rd::<2>(r, &mut o),
+            s_fc_w: rd::<14>(r, &mut o),
+            s_fc_b: rd::<2>(r, &mut o),
+            d_fc_w: rd::<14>(r, &mut o),
+            d_fc_b: rd::<2>(r, &mut o),
             input_mean: {
                 let v = r[o];
                 o += 1;
@@ -417,8 +495,14 @@ impl GruW {
         let zz = e0 + e1;
         (
             [e0 / zz, e1 / zz],
-            [sl[0].clamp(-25.0, 25.0).exp(), sl[1].clamp(-25.0, 25.0).exp()],
-            [dl[0].clamp(-25.0, 25.0).exp(), dl[1].clamp(-25.0, 25.0).exp()],
+            [
+                sl[0].clamp(-25.0, 25.0).exp(),
+                sl[1].clamp(-25.0, 25.0).exp(),
+            ],
+            [
+                dl[0].clamp(-25.0, 25.0).exp(),
+                dl[1].clamp(-25.0, 25.0).exp(),
+            ],
         )
     }
 
@@ -650,8 +734,9 @@ pub fn simulate_fsrs7<'py>(
                 let mut round_cost = 0.0f64;
 
                 for c in 0..deck_size {
-                    let rev_cand =
-                        s_long[c] > 0.0 && due[c] < today_f + 1.0 && same_day[c] < max_same_day as f64;
+                    let rev_cand = s_long[c] > 0.0
+                        && due[c] < today_f + 1.0
+                        && same_day[c] < max_same_day as f64;
                     let learn_cand = rnd == 0 && s_long[c] == 0.0;
                     if !(rev_cand || learn_cand) {
                         continue;
@@ -716,8 +801,9 @@ pub fn simulate_fsrs7<'py>(
                     // apply the memory update / init
                     if rev_cand {
                         let t_us = Instant::now();
-                        let (nsl, nss, nd) =
-                            update_state(dt, rating, s_long[c], s_short[c], diff[c], &wd, s_min, s_max);
+                        let (nsl, nss, nd) = update_state(
+                            dt, rating, s_long[c], s_short[c], diff[c], &wd, s_min, s_max,
+                        );
                         t_fsrs_ns += t_us.elapsed().as_nanos();
                         s_long[c] = nsl;
                         s_short[c] = nss;
@@ -749,9 +835,18 @@ pub fn simulate_fsrs7<'py>(
                     let new_ivl: f64 = match pol {
                         Policy::Fixed => policy_param,
                         Policy::Dr => {
+                            // Simulator scheduling uses the fast Newton inverse (realistic
+                            // states only); the Bellman solver keeps Brent. n_iter is the
+                            // Newton step count (= fsrs7.NEWTON_N_ITER, passed from Python).
                             let t_inv = Instant::now();
-                            let v = forgetting_curve_inverse(
-                                policy_param, s_long[c], s_short[c], diff[c], &wd, n_iter, MIN_IVL,
+                            let v = forgetting_curve_inverse_newton(
+                                policy_param,
+                                s_long[c],
+                                s_short[c],
+                                diff[c],
+                                &wd,
+                                n_iter,
+                                MIN_IVL,
                                 S_MAX,
                             );
                             t_fsrs_ns += t_inv.elapsed().as_nanos();
@@ -759,7 +854,8 @@ pub fn simulate_fsrs7<'py>(
                         }
                         Policy::SspMmc => {
                             // SSP-MMC: look up the optimal target retention for this state
-                            // (nearest grid cell), then invert the curve to an interval.
+                            // (nearest grid cell), then invert the curve to an interval
+                            // (Newton fast path, same as the DR policy).
                             let t_inv = Instant::now();
                             let sg = sgrid_v.as_ref().unwrap();
                             let dg = dgrid_v.as_ref().unwrap();
@@ -769,7 +865,7 @@ pub fn simulate_fsrs7<'py>(
                             let ss_i = s2i(sg, s_short[c]);
                             let d_i = d2i(dg, diff[c]);
                             let target_r = rt[(d_i * ssz + sl_i) * ssz + ss_i];
-                            let v = forgetting_curve_inverse(
+                            let v = forgetting_curve_inverse_newton(
                                 target_r, s_long[c], s_short[c], diff[c], &wd, n_iter, MIN_IVL,
                                 S_MAX,
                             );
