@@ -22,6 +22,8 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use rayon::prelude::*;
+
 use crate::rng;
 
 const S_MAX: f64 = 36500.0;
@@ -30,6 +32,7 @@ const D_MAX: f64 = 10.0;
 const MIN_IVL: f64 = 1.0 / 1440.0; // 1 minute in days
 const MEMRISE7: [f64; 7] = [4.0 / 24.0, 12.0 / 24.0, 1.0, 6.0, 12.0, 48.0, 96.0];
 
+#[derive(Clone, Copy)]
 enum Policy {
     Fixed,
     Dr,
@@ -536,6 +539,309 @@ impl GruW {
 
 }
 
+/// Simulate ONE user's deck over the span (all owned inputs -> owned outputs), so the
+/// per-user axis can be run in parallel (rayon) with the GIL released. Byte-for-byte
+/// identical to the previous in-loop body; the RNG is keyed by the global cell index
+/// `p*deck_size + c`, so results are independent of execution order/threads. Returns
+/// per-day (review, learn, memorized, cost) plus the FSRS/GRU profiler ns for this user.
+#[allow(clippy::too_many_arguments)]
+fn run_user(
+    p: usize,
+    deck_size: usize,
+    learn_span: usize,
+    seed: u64,
+    wd: &[f64],
+    lc: &[f64; 4],
+    rc: &[f64; 4],
+    cum_first: &[f64; 4],
+    cum_review: &[f64; 3],
+    gru_row: Option<&[f64]>,
+    ret_row: Option<&[f64]>,
+    sgrid: Option<&[f64]>,
+    dgrid: Option<&[f64]>,
+    pol: Policy,
+    policy_param: f64,
+    max_cost_perday: f64,
+    learn_limit_perday: i64,
+    review_limit_perday: i64,
+    s_min: f64,
+    s_max: f64,
+    max_same_day: usize,
+    n_iter: usize,
+    span: u64,
+    mr: u64,
+    cells: u64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u128, u128) {
+    let mut t_fsrs_ns: u128 = 0;
+    let mut t_gru_ns: u128 = 0;
+    let mut review_out = vec![0.0f64; learn_span];
+    let mut learn_out = vec![0.0f64; learn_span];
+    let mut mem_out = vec![0.0f64; learn_span];
+    let mut cost_out = vec![0.0f64; learn_span];
+
+    // per-card state (s_long == 0 marks not-yet-learned; due == +inf = unscheduled)
+    let mut s_long = vec![0.0f64; deck_size];
+    let mut s_short = vec![0.0f64; deck_size];
+    let mut diff = vec![0.0f64; deck_size];
+    let mut last_date = vec![0.0f64; deck_size];
+    let mut due = vec![f64::INFINITY; deck_size];
+    let mut ivl = vec![0.0f64; deck_size];
+    let mut ease = vec![2.5f64; deck_size];
+    let mut same_day = vec![0.0f64; deck_size];
+
+    // first-review rating: KIND_INIT_RATING=0, day 0, round 0 -> counter = cell index
+    let mut first_rating = vec![0i64; deck_size];
+    for c in 0..deck_size {
+        let cell = (p * deck_size + c) as u64;
+        first_rating[c] = (categorical(rng::uniform(cell, seed), cum_first) + 1) as i64;
+    }
+
+    // GRU predictor state for this user (if enabled): per-user weights + per-card hidden h.
+    let gw = gru_row.map(GruW::from_row);
+    let mut hgru: Vec<[f64; 7]> = if gw.is_some() {
+        vec![[0.0; 7]; deck_size]
+    } else {
+        Vec::new()
+    };
+    // Per-card cache of curve(hgru[c]) (dt-independent GRU heads), kept in lock-step with
+    // hgru: initialised from the zero hidden, refreshed after every step.
+    let mut gcurve: Vec<GruCurve> = match &gw {
+        Some(g) => vec![g.curve(&[0.0; 7]); deck_size],
+        None => Vec::new(),
+    };
+
+    for today in 0..learn_span {
+        let today_f = today as f64;
+
+        // memorized snapshot (start of day, learned cards).
+        let t_snap = Instant::now();
+        let mut mem = 0.0f64;
+        for c in 0..deck_size {
+            if s_long[c] > 0.0 {
+                let dt = (today_f - last_date[c]).max(0.0);
+                mem += match &gw {
+                    Some(_g) => gru_p_recall_from(&gcurve[c], dt),
+                    None => forgetting_curve(
+                        dt,
+                        s_long[c].clamp(s_min, s_max),
+                        s_short[c].clamp(s_min, s_max),
+                        diff[c].clamp(D_MIN, D_MAX),
+                        wd,
+                    ),
+                };
+            }
+        }
+        if gw.is_some() {
+            t_gru_ns += t_snap.elapsed().as_nanos();
+        } else {
+            t_fsrs_ns += t_snap.elapsed().as_nanos();
+        }
+        mem_out[today] = mem;
+
+        // per-day shared budgets, carried across same-day rounds
+        let mut cost_used = 0.0f64;
+        let mut reviews_used = 0i64;
+        let mut learns_used = 0i64;
+        for c in 0..deck_size {
+            same_day[c] = 0.0;
+        }
+        let mut day_reviews = 0u32;
+        let mut day_learns = 0u32;
+
+        for rnd in 0..max_same_day {
+            let base_forget = ((span + today as u64) * mr + rnd as u64) * cells; // KIND_FORGET=1
+            let base_pass = ((2 * span + today as u64) * mr + rnd as u64) * cells; // KIND_PASS_RATING=2
+
+            let mut cc = cost_used;
+            let mut cr = reviews_used;
+            let mut cl = learns_used;
+            let mut any_cand = false;
+            let mut any_admit = false;
+            let mut round_cost = 0.0f64;
+
+            for c in 0..deck_size {
+                let rev_cand = s_long[c] > 0.0
+                    && due[c] < today_f + 1.0
+                    && same_day[c] < max_same_day as f64;
+                let learn_cand = rnd == 0 && s_long[c] == 0.0;
+                if !(rev_cand || learn_cand) {
+                    continue;
+                }
+                any_cand = true;
+
+                let cell = (p * deck_size + c) as u64;
+                let (rating, cnd_cost, t_review, dt);
+                if rev_cand {
+                    t_review = due[c].max(today_f);
+                    dt = (t_review - last_date[c]).max(0.0);
+                    let t_r = Instant::now();
+                    let r = match &gw {
+                        Some(_g) => gru_p_recall_from(&gcurve[c], dt),
+                        None => forgetting_curve(
+                            dt,
+                            s_long[c].clamp(s_min, s_max),
+                            s_short[c].clamp(s_min, s_max),
+                            diff[c].clamp(D_MIN, D_MAX),
+                            wd,
+                        ),
+                    };
+                    if gw.is_some() {
+                        t_gru_ns += t_r.elapsed().as_nanos();
+                    } else {
+                        t_fsrs_ns += t_r.elapsed().as_nanos();
+                    }
+                    let recalled = rng::uniform(base_forget + cell, seed) <= r;
+                    rating = if recalled {
+                        (categorical(rng::uniform(base_pass + cell, seed), cum_review) + 2) as i64
+                    } else {
+                        1
+                    };
+                    cnd_cost = rc[(rating - 1) as usize];
+                } else {
+                    rating = first_rating[c];
+                    cnd_cost = lc[(rating - 1) as usize];
+                    t_review = today_f;
+                    dt = 0.0;
+                }
+
+                cc += cnd_cost;
+                if rev_cand {
+                    cr += 1;
+                }
+                if learn_cand {
+                    cl += 1;
+                }
+                let admit = cc <= max_cost_perday
+                    && (!rev_cand || cr <= review_limit_perday)
+                    && (!learn_cand || cl <= learn_limit_perday);
+                if !admit {
+                    continue;
+                }
+                any_admit = true;
+                round_cost += cnd_cost;
+
+                if rev_cand {
+                    let t_us = Instant::now();
+                    let (nsl, nss, nd) =
+                        update_state(dt, rating, s_long[c], s_short[c], diff[c], wd, s_min, s_max);
+                    t_fsrs_ns += t_us.elapsed().as_nanos();
+                    s_long[c] = nsl;
+                    s_short[c] = nss;
+                    diff[c] = nd;
+                    last_date[c] = t_review;
+                    same_day[c] += 1.0;
+                    day_reviews += 1;
+                } else {
+                    let (isl, iss, idd) = init_state(rating, wd, s_min);
+                    s_long[c] = isl;
+                    s_short[c] = iss;
+                    diff[c] = idd;
+                    last_date[c] = today_f;
+                    day_learns += 1;
+                }
+
+                if let Some(g) = &gw {
+                    let t_st = Instant::now();
+                    hgru[c] = g.step(&hgru[c], dt, rating);
+                    gcurve[c] = g.curve(&hgru[c]); // keep the cache in lock-step with h
+                    t_gru_ns += t_st.elapsed().as_nanos();
+                }
+
+                let is_learn = learn_cand;
+                let prev = if is_learn { 0.0 } else { ivl[c] };
+                let base_time = if is_learn { today_f } else { t_review };
+                let new_ivl: f64 = match pol {
+                    Policy::Fixed => policy_param,
+                    Policy::Dr => {
+                        let t_inv = Instant::now();
+                        let v = forgetting_curve_inverse_newton(
+                            policy_param, s_long[c], s_short[c], diff[c], wd, n_iter, MIN_IVL, S_MAX,
+                        );
+                        t_fsrs_ns += t_inv.elapsed().as_nanos();
+                        v
+                    }
+                    Policy::SspMmc => {
+                        let t_inv = Instant::now();
+                        let sg = sgrid.unwrap();
+                        let dg = dgrid.unwrap();
+                        let rt = ret_row.unwrap();
+                        let ssz = sg.len();
+                        let sl_i = s2i(sg, s_long[c]);
+                        let ss_i = s2i(sg, s_short[c]);
+                        let d_i = d2i(dg, diff[c]);
+                        let target_r = rt[(d_i * ssz + sl_i) * ssz + ss_i];
+                        let v = forgetting_curve_inverse_newton(
+                            target_r, s_long[c], s_short[c], diff[c], wd, n_iter, MIN_IVL, S_MAX,
+                        );
+                        t_fsrs_ns += t_inv.elapsed().as_nanos();
+                        v
+                    }
+                    Policy::Memrise => {
+                        if prev == 0.0 || rating == 1 {
+                            MEMRISE7[0]
+                        } else {
+                            memrise_next_rung(prev)
+                        }
+                    }
+                    Policy::Sm2 => {
+                        let ease_in = if is_learn { 2.5 } else { ease[c] };
+                        let ease_c = ease_in.clamp(1.3, 5.5);
+                        let mut interval = if prev == 0.0 {
+                            if rating < 4 {
+                                1.0
+                            } else {
+                                4.0
+                            }
+                        } else {
+                            let current = prev.max(1.0);
+                            let hard = constrain_f64(current * 1.2, current + 1.0);
+                            let good = constrain_f64(current * ease_c, hard + 1.0);
+                            let easy = constrain_f64(current * ease_c * 1.3, good + 1.0);
+                            match rating {
+                                2 => hard,
+                                4 => easy,
+                                _ => good,
+                            }
+                        };
+                        if rating == 1 {
+                            interval = 1.0;
+                        }
+                        let mut ne = ease_c;
+                        if rating == 1 {
+                            ne -= 0.2;
+                        }
+                        if rating == 2 {
+                            ne -= 0.15;
+                        }
+                        if rating == 4 {
+                            ne += 0.15;
+                        }
+                        ease[c] = ne.clamp(1.3, 5.5);
+                        interval
+                    }
+                };
+                let new_ivl = new_ivl.clamp(MIN_IVL, s_max);
+                ivl[c] = new_ivl;
+                due[c] = base_time + new_ivl;
+            }
+
+            cost_used += round_cost;
+            reviews_used = day_reviews as i64;
+            learns_used = day_learns as i64;
+
+            if !any_cand || !any_admit {
+                break;
+            }
+        }
+
+        review_out[today] = day_reviews as f64;
+        learn_out[today] = day_learns as f64;
+        cost_out[today] = cost_used;
+    }
+
+    (review_out, learn_out, mem_out, cost_out, t_fsrs_ns, t_gru_ns)
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (
@@ -639,328 +945,106 @@ pub fn simulate_fsrs7<'py>(
     let span = learn_span as u64;
     let mr = max_same_day as u64;
 
-    for p in 0..parallel {
-        let wd: Vec<f64> = (0..w.shape()[1]).map(|i| w[[p, i]]).collect();
-        let lc = [
-            learn_costs[[p, 0]],
-            learn_costs[[p, 1]],
-            learn_costs[[p, 2]],
-            learn_costs[[p, 3]],
-        ];
-        let rc = [
-            review_costs[[p, 0]],
-            review_costs[[p, 1]],
-            review_costs[[p, 2]],
-            review_costs[[p, 3]],
-        ];
-        let mut cum_first = [0.0f64; 4];
-        let mut acc = 0.0;
-        for i in 0..4 {
-            acc += first_rating_prob[[p, i]];
-            cum_first[i] = acc;
-        }
-        let mut cum_review = [0.0f64; 3];
-        acc = 0.0;
-        for i in 0..3 {
-            acc += review_rating_prob[[p, i]];
-            cum_review[i] = acc;
-        }
-
-        // per-card state (s_long == 0 marks not-yet-learned; due == +inf = unscheduled)
-        let mut s_long = vec![0.0f64; deck_size];
-        let mut s_short = vec![0.0f64; deck_size];
-        let mut diff = vec![0.0f64; deck_size];
-        let mut last_date = vec![0.0f64; deck_size];
-        let mut due = vec![f64::INFINITY; deck_size];
-        let mut ivl = vec![0.0f64; deck_size];
-        let mut ease = vec![2.5f64; deck_size];
-        let mut same_day = vec![0.0f64; deck_size];
-
-        // first-review rating: KIND_INIT_RATING=0, day 0, round 0 -> counter = cell index
-        let mut first_rating = vec![0i64; deck_size];
-        for c in 0..deck_size {
-            let cell = (p * deck_size + c) as u64;
-            first_rating[c] = (categorical(rng::uniform(cell, seed), &cum_first) + 1) as i64;
-        }
-
-        // GRU predictor state for this user (if enabled): per-user weights + per-card hidden h.
-        let gw = gru_view.as_ref().map(|gv| {
-            let row: Vec<f64> = (0..GRU_FLAT_LEN).map(|i| gv[[p, i]]).collect();
-            GruW::from_row(&row)
-        });
-        let mut hgru: Vec<[f64; 7]> = if gw.is_some() {
-            vec![[0.0; 7]; deck_size]
-        } else {
-            Vec::new()
-        };
-        // Per-card cache of curve(hgru[c]) (dt-independent GRU heads), kept in lock-step with
-        // hgru: initialised from the zero hidden, refreshed after every step. The daily
-        // snapshot and the recall draw read this instead of re-running the GRU heads.
-        let mut gcurve: Vec<GruCurve> = match &gw {
-            Some(g) => vec![g.curve(&[0.0; 7]); deck_size],
-            None => Vec::new(),
-        };
-        // SSP-MMC per-user target-retention table, flattened [d, s_long, s_short].
-        let ret_row: Option<Vec<f64>> = ret_view
-            .as_ref()
-            .map(|rv| (0..rv.shape()[1]).map(|i| rv[[p, i]]).collect());
-
-        for today in 0..learn_span {
-            let today_f = today as f64;
-
-            // memorized snapshot (start of day, learned cards). The whole loop is one op
-            // class -- GRU p_recall when enabled, else FSRS forgetting_curve -- so block-time
-            // it (one Instant/day) to keep profiler overhead negligible.
-            let t_snap = Instant::now();
-            let mut mem = 0.0f64;
-            for c in 0..deck_size {
-                if s_long[c] > 0.0 {
-                    let dt = (today_f - last_date[c]).max(0.0);
-                    mem += match &gw {
-                        Some(_g) => gru_p_recall_from(&gcurve[c], dt),
-                        None => forgetting_curve(
-                            dt,
-                            s_long[c].clamp(s_min, s_max),
-                            s_short[c].clamp(s_min, s_max),
-                            diff[c].clamp(D_MIN, D_MAX),
-                            &wd,
-                        ),
-                    };
-                }
+    // Extract owned per-user inputs (this reads the Python array views, so it must run
+    // before the GIL is released). Then run the per-user sims in PARALLEL -- rayon over the
+    // user axis, which is embarrassingly parallel (users are independent; the RNG is keyed
+    // by the global cell index) -- with the GIL released. Finally write the owned per-user
+    // outputs back into the result arrays (disjoint rows, so order-independent + identical).
+    let n_w = w.shape()[1];
+    type UserIn = (
+        Vec<f64>,
+        [f64; 4],
+        [f64; 4],
+        [f64; 4],
+        [f64; 3],
+        Option<Vec<f64>>,
+        Option<Vec<f64>>,
+    );
+    let inputs: Vec<UserIn> = (0..parallel)
+        .map(|p| {
+            let wd: Vec<f64> = (0..n_w).map(|i| w[[p, i]]).collect();
+            let lc = [
+                learn_costs[[p, 0]],
+                learn_costs[[p, 1]],
+                learn_costs[[p, 2]],
+                learn_costs[[p, 3]],
+            ];
+            let rc = [
+                review_costs[[p, 0]],
+                review_costs[[p, 1]],
+                review_costs[[p, 2]],
+                review_costs[[p, 3]],
+            ];
+            let mut cum_first = [0.0f64; 4];
+            let mut acc = 0.0;
+            for i in 0..4 {
+                acc += first_rating_prob[[p, i]];
+                cum_first[i] = acc;
             }
-            if gw.is_some() {
-                t_gru_ns += t_snap.elapsed().as_nanos();
-            } else {
-                t_fsrs_ns += t_snap.elapsed().as_nanos();
+            let mut cum_review = [0.0f64; 3];
+            acc = 0.0;
+            for i in 0..3 {
+                acc += review_rating_prob[[p, i]];
+                cum_review[i] = acc;
             }
-            memorized[[p, today]] = mem;
+            let gru_row: Option<Vec<f64>> = gru_view
+                .as_ref()
+                .map(|gv| (0..GRU_FLAT_LEN).map(|i| gv[[p, i]]).collect());
+            let ret_row: Option<Vec<f64>> = ret_view
+                .as_ref()
+                .map(|rv| (0..rv.shape()[1]).map(|i| rv[[p, i]]).collect());
+            (wd, lc, rc, cum_first, cum_review, gru_row, ret_row)
+        })
+        .collect();
 
-            // per-day shared budgets, carried across same-day rounds
-            let mut cost_used = 0.0f64;
-            let mut reviews_used = 0i64;
-            let mut learns_used = 0i64;
-            for c in 0..deck_size {
-                same_day[c] = 0.0;
-            }
-            let mut day_reviews = 0u32;
-            let mut day_learns = 0u32;
+    let sgrid_ref = sgrid_v.as_deref();
+    let dgrid_ref = dgrid_v.as_deref();
+    type UserOut = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u128, u128);
+    let results: Vec<UserOut> = py.allow_threads(|| {
+        inputs
+            .par_iter()
+            .enumerate()
+            .map(|(p, inp)| {
+                run_user(
+                    p,
+                    deck_size,
+                    learn_span,
+                    seed,
+                    &inp.0,
+                    &inp.1,
+                    &inp.2,
+                    &inp.3,
+                    &inp.4,
+                    inp.5.as_deref(),
+                    inp.6.as_deref(),
+                    sgrid_ref,
+                    dgrid_ref,
+                    pol,
+                    policy_param,
+                    max_cost_perday,
+                    learn_limit_perday,
+                    review_limit_perday,
+                    s_min,
+                    s_max,
+                    max_same_day,
+                    n_iter,
+                    span,
+                    mr,
+                    cells,
+                )
+            })
+            .collect()
+    });
 
-            for rnd in 0..max_same_day {
-                let base_forget = ((span + today as u64) * mr + rnd as u64) * cells; // KIND_FORGET=1
-                let base_pass = ((2 * span + today as u64) * mr + rnd as u64) * cells; // KIND_PASS_RATING=2
-
-                // cumulative budgets over the whole deck (prefix in card-index order),
-                // continued from earlier rounds via cost_used / reviews_used / learns_used.
-                let mut cc = cost_used;
-                let mut cr = reviews_used;
-                let mut cl = learns_used;
-                let mut any_cand = false;
-                let mut any_admit = false;
-                let mut round_cost = 0.0f64;
-
-                for c in 0..deck_size {
-                    let rev_cand = s_long[c] > 0.0
-                        && due[c] < today_f + 1.0
-                        && same_day[c] < max_same_day as f64;
-                    let learn_cand = rnd == 0 && s_long[c] == 0.0;
-                    if !(rev_cand || learn_cand) {
-                        continue;
-                    }
-                    any_cand = true;
-
-                    // resolve rating + cost + (for reviews) recall and elapsed time. A lapse
-                    // is fully encoded by rating==1 (update_state / next_difficulty handle it).
-                    let cell = (p * deck_size + c) as u64;
-                    let (rating, cnd_cost, t_review, dt);
-                    if rev_cand {
-                        t_review = due[c].max(today_f);
-                        dt = (t_review - last_date[c]).max(0.0);
-                        let t_r = Instant::now();
-                        let r = match &gw {
-                            Some(_g) => gru_p_recall_from(&gcurve[c], dt),
-                            None => forgetting_curve(
-                                dt,
-                                s_long[c].clamp(s_min, s_max),
-                                s_short[c].clamp(s_min, s_max),
-                                diff[c].clamp(D_MIN, D_MAX),
-                                &wd,
-                            ),
-                        };
-                        if gw.is_some() {
-                            t_gru_ns += t_r.elapsed().as_nanos();
-                        } else {
-                            t_fsrs_ns += t_r.elapsed().as_nanos();
-                        }
-                        let recalled = rng::uniform(base_forget + cell, seed) <= r;
-                        rating = if recalled {
-                            (categorical(rng::uniform(base_pass + cell, seed), &cum_review) + 2)
-                                as i64
-                        } else {
-                            1
-                        };
-                        cnd_cost = rc[(rating - 1) as usize];
-                    } else {
-                        rating = first_rating[c];
-                        cnd_cost = lc[(rating - 1) as usize];
-                        t_review = today_f;
-                        dt = 0.0;
-                    }
-
-                    // gating (cumsum includes every candidate, matching the Python cumsum)
-                    cc += cnd_cost;
-                    if rev_cand {
-                        cr += 1;
-                    }
-                    if learn_cand {
-                        cl += 1;
-                    }
-                    let admit = cc <= max_cost_perday
-                        && (!rev_cand || cr <= review_limit_perday)
-                        && (!learn_cand || cl <= learn_limit_perday);
-                    if !admit {
-                        continue;
-                    }
-                    any_admit = true;
-                    round_cost += cnd_cost;
-
-                    // apply the memory update / init
-                    if rev_cand {
-                        let t_us = Instant::now();
-                        let (nsl, nss, nd) = update_state(
-                            dt, rating, s_long[c], s_short[c], diff[c], &wd, s_min, s_max,
-                        );
-                        t_fsrs_ns += t_us.elapsed().as_nanos();
-                        s_long[c] = nsl;
-                        s_short[c] = nss;
-                        diff[c] = nd;
-                        last_date[c] = t_review;
-                        same_day[c] += 1.0;
-                        day_reviews += 1;
-                    } else {
-                        let (isl, iss, idd) = init_state(rating, &wd, s_min);
-                        s_long[c] = isl;
-                        s_short[c] = iss;
-                        diff[c] = idd;
-                        last_date[c] = today_f;
-                        day_learns += 1;
-                    }
-
-                    // advance the GRU hidden state with the realized (dt, rating): learning
-                    // uses (dt = 0, first_rating); a review uses its elapsed dt and rev rating.
-                    if let Some(g) = &gw {
-                        let t_st = Instant::now();
-                        hgru[c] = g.step(&hgru[c], dt, rating);
-                        gcurve[c] = g.curve(&hgru[c]); // keep the cache in lock-step with h
-                        t_gru_ns += t_st.elapsed().as_nanos();
-                    }
-
-                    // schedule the next interval / due
-                    let is_learn = learn_cand;
-                    let prev = if is_learn { 0.0 } else { ivl[c] };
-                    let base_time = if is_learn { today_f } else { t_review };
-                    let new_ivl: f64 = match pol {
-                        Policy::Fixed => policy_param,
-                        Policy::Dr => {
-                            // Simulator scheduling uses the fast Newton inverse (realistic
-                            // states only); the Bellman solver keeps Brent. n_iter is the
-                            // Newton step count (= fsrs7.NEWTON_N_ITER, passed from Python).
-                            let t_inv = Instant::now();
-                            let v = forgetting_curve_inverse_newton(
-                                policy_param,
-                                s_long[c],
-                                s_short[c],
-                                diff[c],
-                                &wd,
-                                n_iter,
-                                MIN_IVL,
-                                S_MAX,
-                            );
-                            t_fsrs_ns += t_inv.elapsed().as_nanos();
-                            v
-                        }
-                        Policy::SspMmc => {
-                            // SSP-MMC: look up the optimal target retention for this state
-                            // (nearest grid cell), then invert the curve to an interval
-                            // (Newton fast path, same as the DR policy).
-                            let t_inv = Instant::now();
-                            let sg = sgrid_v.as_ref().unwrap();
-                            let dg = dgrid_v.as_ref().unwrap();
-                            let rt = ret_row.as_ref().unwrap();
-                            let ssz = sg.len();
-                            let sl_i = s2i(sg, s_long[c]);
-                            let ss_i = s2i(sg, s_short[c]);
-                            let d_i = d2i(dg, diff[c]);
-                            let target_r = rt[(d_i * ssz + sl_i) * ssz + ss_i];
-                            let v = forgetting_curve_inverse_newton(
-                                target_r, s_long[c], s_short[c], diff[c], &wd, n_iter, MIN_IVL,
-                                S_MAX,
-                            );
-                            t_fsrs_ns += t_inv.elapsed().as_nanos();
-                            v
-                        }
-                        Policy::Memrise => {
-                            if prev == 0.0 || rating == 1 {
-                                MEMRISE7[0]
-                            } else {
-                                memrise_next_rung(prev)
-                            }
-                        }
-                        Policy::Sm2 => {
-                            let ease_in = if is_learn { 2.5 } else { ease[c] };
-                            let ease_c = ease_in.clamp(1.3, 5.5);
-                            let mut interval = if prev == 0.0 {
-                                if rating < 4 {
-                                    1.0
-                                } else {
-                                    4.0
-                                }
-                            } else {
-                                let current = prev.max(1.0);
-                                let hard = constrain_f64(current * 1.2, current + 1.0);
-                                let good = constrain_f64(current * ease_c, hard + 1.0);
-                                let easy = constrain_f64(current * ease_c * 1.3, good + 1.0);
-                                match rating {
-                                    2 => hard,
-                                    4 => easy,
-                                    _ => good,
-                                }
-                            };
-                            if rating == 1 {
-                                interval = 1.0;
-                            }
-                            let mut ne = ease_c;
-                            if rating == 1 {
-                                ne -= 0.2;
-                            }
-                            if rating == 2 {
-                                ne -= 0.15;
-                            }
-                            if rating == 4 {
-                                ne += 0.15;
-                            }
-                            ease[c] = ne.clamp(1.3, 5.5);
-                            interval
-                        }
-                    };
-                    let new_ivl = new_ivl.clamp(MIN_IVL, s_max);
-                    ivl[c] = new_ivl;
-                    due[c] = base_time + new_ivl;
-                }
-
-                // carry the admitted totals into the next same-day round
-                cost_used += round_cost;
-                reviews_used = day_reviews as i64;
-                learns_used = day_learns as i64;
-
-                if !any_cand || !any_admit {
-                    break;
-                }
-            }
-
-            review_cnt[[p, today]] = day_reviews as f64;
-            learn_cnt[[p, today]] = day_learns as f64;
-            cost_day[[p, today]] = cost_used;
+    for (p, (rev, lrn, mem, cost, tf, tg)) in results.into_iter().enumerate() {
+        for t in 0..learn_span {
+            review_cnt[[p, t]] = rev[t];
+            learn_cnt[[p, t]] = lrn[t];
+            memorized[[p, t]] = mem[t];
+            cost_day[[p, t]] = cost[t];
         }
+        t_fsrs_ns += tf;
+        t_gru_ns += tg;
     }
 
     Ok((
