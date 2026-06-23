@@ -288,8 +288,10 @@ def main():
                 hp_sets, n_iter=args.n_iter, batch_size=args.batch_size
             )
             solve_times.append(time.perf_counter() - ts)
+            iters_all = []
             for si, (set_converged, fm, iters) in enumerate(verdicts):
                 worst_frac = max(worst_frac, fm)
+                iters_all.append(iters)
                 if not set_converged:
                     user_converged = False
                     failed_sets.append({"set": si, "frac_at_max": fm, "iters": iters})
@@ -299,9 +301,14 @@ def main():
                         f"iters={iters} {'OK' if set_converged else 'NOT CONVERGED'}"
                     )
 
+            # Iterations to converge across this user's 15 sets. NOTE: the batched solver
+            # shares one iteration counter per group of `batch_size` sets (a set inherits the
+            # slowest-in-group count), so these are at batch granularity, capped at --n-iter.
             results[user_id] = {
                 "converged": user_converged,
                 "worst_frac_at_max": worst_frac,
+                "mean_iters": float(np.mean(iters_all)),
+                "max_iters": int(np.max(iters_all)),
                 "failed_sets": failed_sets,
             }
             if not user_converged:
@@ -324,7 +331,9 @@ def main():
         print(
             f"[{len(results)}/{n}] user {user_id}: "
             f"{'CONVERGED' if user_converged else 'UNCONVERGED'} "
-            f"(worst frac_at_max={worst_frac:.3%})  |  running rate: "
+            f"(worst frac_at_max={worst_frac:.3%}, "
+            f"mean/max iters={results[user_id]['mean_iters']:.0f}/{results[user_id]['max_iters']})"
+            f"  |  running rate: "
             f"{conv_count}/{len(results)} = {conv_count / max(len(results), 1):.1%}"
         )
 
@@ -349,6 +358,18 @@ def main():
         print(f"Errored IDs:        {sorted(errored)}")
     if invalid:
         print(f"Invalid-data IDs:   {sorted(invalid)}")
+    mean_iters_vals = [
+        r["mean_iters"] for r in results.values() if r.get("mean_iters") is not None
+    ]
+    max_iters_vals = [
+        r["max_iters"] for r in results.values() if r.get("max_iters") is not None
+    ]
+    if mean_iters_vals:
+        print(
+            f"Iterations to converge ({len(mean_iters_vals)} users w/ stat): "
+            f"mean of per-user mean={np.mean(mean_iters_vals):.1f}, "
+            f"max of per-user max={max(max_iters_vals)} (cap {args.n_iter})"
+        )
     print(
         f"Timing: build mean={np.mean(build_times):.2f}s, "
         f"solve mean={np.mean(solve_times):.2f}s/user (15 sets, bs={args.batch_size}), "
