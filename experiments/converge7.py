@@ -35,7 +35,11 @@ for path in (ROOT_DIR, SRC_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ssp_mmc_fsrs.solver7 import SSPMMCSolver7  # noqa: E402
+from ssp_mmc_fsrs.solver7 import (  # noqa: E402
+    SSPMMCSolver7,
+    build_hybrid_s_grid,
+    build_production_d_grid,
+)
 
 DEFAULT_PARAMS = (
     ROOT_DIR.parent / "srs-benchmark" / "result" / "FSRS-7-short-secs-recency.jsonl"
@@ -129,6 +133,20 @@ def parse_args():
     )
     p.add_argument("--n-s", type=int, default=None, help="Override S grid size (N_S).")
     p.add_argument(
+        "--grid",
+        choices=["production", "loguniform"],
+        default="production",
+        help="production = hybrid-S(71) + coarser-D(35) ~= 176k states (~9x fewer than the "
+        "old uniform 135/91 grid, much faster); loguniform = old uniform N_S grid (--n-s).",
+    )
+    p.add_argument(
+        "--shard",
+        type=str,
+        default=None,
+        help="i/N: process the i-th of N strided shards of the user list, for running "
+        "several processes in parallel on disjoint users (fills an under-used GPU).",
+    )
+    p.add_argument(
         "--batch-size",
         type=int,
         default=4,
@@ -163,13 +181,28 @@ def main():
     n = min(args.n_users, len(common))
     user_ids = sorted(rng.choice(common, size=n, replace=False).tolist())
 
+    # Strided shard for parallel runs (each process takes every N-th user, kept balanced).
+    if args.shard:
+        si, sn = (int(x) for x in args.shard.split("/"))
+        user_ids = user_ids[si::sn]
+    n = len(user_ids)
+
     hp_sets = make_hyperparam_sets(N_HYPERPARAM_SETS, seed=args.hp_seed)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    n_s_kw = {"n_s": args.n_s} if args.n_s else {}
+    if args.grid == "production":
+        grid_kw = {
+            "s_state": build_hybrid_s_grid(),
+            "d_state": build_production_d_grid(),
+        }
+        grid_desc = "production hybrid-S(71)+coarser-D(35) ~176k states"
+    else:
+        grid_kw = {"n_s": args.n_s} if args.n_s else {}
+        grid_desc = f"loguniform N_S={args.n_s or 'default'}"
 
     print(
         f"Users: {n} (of {len(common)} available)  |  hyperparam sets: {len(hp_sets)}  |  "
-        f"device: {device}  |  n_iter cap: {args.n_iter}  |  N_S: {args.n_s or 'default'}"
+        f"device: {device}  |  n_iter cap: {args.n_iter}  |  grid: {grid_desc}"
+        + (f"  |  shard {args.shard}" if args.shard else "")
     )
 
     results = {}
@@ -241,7 +274,7 @@ def main():
                 review_rating_prob=u["review_rating_prob"],
                 w=w,
                 device=device,
-                **n_s_kw,
+                **grid_kw,
             )
             build_times.append(time.perf_counter() - tb)
 
