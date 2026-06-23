@@ -104,8 +104,18 @@ def categorical(uniforms, probs):
 
     Matches the linear scan in the Rust simulator. ``probs`` need not be perfectly
     normalized; any leftover mass falls into the last category via the clip.
+
+    ``probs`` is either a shared 1-D ``(k,)`` vector (every cell uses it) or a per-user
+    ``(parallel, k)`` matrix, in which case ``uniforms`` is ``(parallel, deck)`` and each
+    deck row uses its own row of ``probs``. Both forms yield identical indices for the
+    same ``(u, cumsum)``.
     """
     probs = np.asarray(probs, dtype=np.float64)
-    cum = np.cumsum(probs)
-    idx = np.searchsorted(cum, uniforms, side="right")
+    if probs.ndim == 1:
+        cum = np.cumsum(probs)
+        idx = np.searchsorted(cum, uniforms, side="right")
+        return np.minimum(idx, probs.shape[-1] - 1)
+    # Per-user: cumsum per row, then count thresholds <= u (== searchsorted 'right').
+    cum = np.cumsum(probs, axis=-1)  # (parallel, k)
+    idx = (uniforms[..., None] >= cum[:, None, :]).sum(axis=-1)  # (parallel, deck)
     return np.minimum(idx, probs.shape[-1] - 1)

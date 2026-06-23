@@ -138,10 +138,20 @@ def init_state(rating, w, s_min):
     """First-review memory state ``(s_long, s_short, d)``.
 
     ``s_long`` = initial stability by rating (w[0..3]); ``s_short`` = 0.8 * s_long;
-    ``d`` = clamped init_d. Stabilities clamped to ``s_min..S_MAX``."""
+    ``d`` = clamped init_d. Stabilities clamped to ``s_min..S_MAX``.
+
+    ``w`` may be a shared 1-D ``(34,)`` tensor or a per-user ``(34, P, 1)`` tensor (the
+    simulator's batched layout). In the per-user case the initial stability is gathered
+    per user (each deck row reads its own ``w[0..3]``)."""
     rating_idx = rating.long().clamp(1, 4) - 1
-    s_long = w[rating_idx].clamp(s_min, S_MAX)
-    s_short = (0.8 * w[rating_idx]).clamp(s_min, S_MAX)
+    if w.dim() == 1:
+        s0 = w[rating_idx]
+    else:
+        # w is (34, P, 1); rating_idx is (P, deck). Gather each user's own w[0..3].
+        w2 = w.squeeze(-1).transpose(0, 1)  # (P, 34)
+        s0 = torch.gather(w2, 1, rating_idx)  # (P, deck)
+    s_long = s0.clamp(s_min, S_MAX)
+    s_short = (0.8 * s0).clamp(s_min, S_MAX)
     d = init_d(rating, w).clamp(D_MIN, D_MAX)
     return s_long, s_short, d
 

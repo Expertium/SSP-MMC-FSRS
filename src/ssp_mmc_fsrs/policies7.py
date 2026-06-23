@@ -29,8 +29,13 @@ MEMRISE_STEPS = [4 / 24, 12 / 24, 1.0, 6.0, 12.0, 48.0, 96.0]
 
 def create_dr_policy(desired_retention, w, n_iter=fsrs7.INVERSE_N_ITER):
     """Fixed desired-retention: schedule the interval at which predicted recall == DR
-    (may be sub-day right after learning / a lapse — that's the intended FSRS-7 behaviour)."""
+    (may be sub-day right after learning / a lapse — that's the intended FSRS-7 behaviour).
+
+    ``w`` may be a shared ``(34,)`` vector or per-user ``(parallel, 34)``; the latter is
+    stored as ``(34, P, 1)`` so it broadcasts against the simulator's ``(P, deck)`` state."""
     w = torch.as_tensor(w, dtype=torch.float64)
+    if w.ndim == 2:  # per-user (P, 34) -> (34, P, 1)
+        w = w.transpose(0, 1).unsqueeze(-1).contiguous()
 
     def dr_policy(s_long, s_short, d, prev_interval, grade, ease):
         wt = w.to(device=s_long.device, dtype=s_long.dtype)
