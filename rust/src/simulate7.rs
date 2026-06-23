@@ -96,10 +96,12 @@ fn short_component_recall(t: f64, s_short: f64, w: &[f64]) -> f64 {
     (t / s_short * factor1 + 1.0).powf(decay1)
 }
 
+/// Dual-stability forgetting curve given a PRE-COMPUTED short component r1 (= the value of
+/// `short_component_recall(t, s_short, w)`). Lets `update_state` reuse the single r1 it needs
+/// for the short-stability update instead of recomputing it inside the curve.
 #[inline]
-pub(crate) fn forgetting_curve(t: f64, s: f64, s_short: f64, d: f64, w: &[f64]) -> f64 {
+fn forgetting_curve_with_r1(t: f64, s: f64, s_short: f64, d: f64, w: &[f64], r1: f64) -> f64 {
     let t = t.max(0.0);
-    let r1 = short_component_recall(t, s_short, w);
     let decay2 = -(w[24].clamp(0.01, 0.95));
     let factor2 = w[26].powf(1.0 / decay2) - 1.0;
     let d_ts = ((d - 5.0) * (w[32] - 0.3)).exp();
@@ -108,6 +110,12 @@ pub(crate) fn forgetting_curve(t: f64, s: f64, s_short: f64, d: f64, w: &[f64]) 
     let weight2 = w[28] * s.powf(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp();
     let retention = (weight1 * r1 + weight2 * r2) / (weight1 + weight2);
     retention * (1.0 - 2e-5) + 1e-5
+}
+
+#[inline]
+pub(crate) fn forgetting_curve(t: f64, s: f64, s_short: f64, d: f64, w: &[f64]) -> f64 {
+    let r1 = short_component_recall(t.max(0.0), s_short, w);
+    forgetting_curve_with_r1(t, s, s_short, d, w, r1)
 }
 
 #[inline]
@@ -174,9 +182,11 @@ pub(crate) fn update_state(
     let last_s = s_long.clamp(s_min, s_max);
     let last_s_short = s_short.clamp(s_min, s_max);
     let last_d = d.clamp(D_MIN, D_MAX);
-    let r = forgetting_curve(dt, last_s, last_s_short, last_d, w);
-    let upd_s_long = next_stability(last_s, last_d, r, rating, 7, w);
+    // r1 (short component) feeds BOTH the mixed retrievability and the short-S update --
+    // compute it once and share it (was computed twice for identical args).
     let r1 = short_component_recall(dt, last_s_short, w);
+    let r = forgetting_curve_with_r1(dt, last_s, last_s_short, last_d, w, r1);
+    let upd_s_long = next_stability(last_s, last_d, r, rating, 7, w);
     let upd_s_short_raw = next_stability(last_s_short, last_d, r1, rating, 15, w);
     let upd_s_short = if rating == 1 {
         upd_s_short_raw.min(0.8 * upd_s_long)
