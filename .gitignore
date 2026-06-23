@@ -9,3 +9,5 @@ notebooks/.ipynb_checkpoints/
 *.egg-info
 rust/target/
 bench/_build/
+bench7/_build/
+bench7/_*.log
