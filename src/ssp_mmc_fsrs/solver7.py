@@ -99,6 +99,93 @@ if HAS_TRITON:
         tl.store(new_state_ptr + s, tl.minimum(s_old, row_min))
 
     @triton.jit
+    def _bellman_greedy_kernel(
+        state_ptr,
+        const_cost_ptr,
+        r_pred_ptr,
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,
+        new_state_ptr,
+        policy_ptr,
+        n_states,
+        r_size,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+        R_BLOCK: tl.constexpr,
+    ):
+        """Greedy Bellman backup for MPI: like ``_bellman_step_kernel`` but ALSO writes the
+        argmin action ``policy[s] = argmin_r av`` so the cheap policy-eval sweeps can reuse it.
+        """
+        s = tl.program_id(0)
+        r = tl.arange(0, R_BLOCK)
+        mask = r < r_size
+        base = s * r_size + r
+        cc = tl.load(const_cost_ptr + base, mask=mask, other=float("inf"))
+        rp = tl.load(r_pred_ptr + base, mask=mask, other=0.0)
+        i0 = tl.load(t0_ptr + base, mask=mask, other=0)
+        i1 = tl.load(t1_ptr + base, mask=mask, other=0)
+        i2 = tl.load(t2_ptr + base, mask=mask, other=0)
+        i3 = tl.load(t3_ptr + base, mask=mask, other=0)
+        v0 = tl.load(state_ptr + i0, mask=mask, other=0.0)
+        v1 = tl.load(state_ptr + i1, mask=mask, other=0.0)
+        v2 = tl.load(state_ptr + i2, mask=mask, other=0.0)
+        v3 = tl.load(state_ptr + i3, mask=mask, other=0.0)
+        prob0 = 1.0 - rp
+        av = cc + discount * (
+            prob0 * v0 + rp * rrp0 * v1 + rp * rrp1 * v2 + rp * rrp2 * v3
+        )
+        av = tl.where(mask, av, float("inf"))
+        row_min = tl.min(av, axis=0)
+        pol = tl.argmin(av, axis=0)
+        s_old = tl.load(state_ptr + s)
+        tl.store(new_state_ptr + s, tl.minimum(s_old, row_min))
+        tl.store(policy_ptr + s, pol)
+
+    @triton.jit
+    def _policy_eval_kernel(
+        state_ptr,
+        const_cost_ptr,
+        r_pred_ptr,
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,
+        policy_ptr,
+        new_state_ptr,
+        n_states,
+        r_size,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+    ):
+        """One fixed-policy evaluation backup (MPI): each state uses its single greedy action
+        ``policy[s]`` (1 gather/branch, no R loop -> ~r_size x cheaper than the greedy kernel).
+        new_state[s] = min(state[s], av_at_policy)."""
+        s = tl.program_id(0)
+        p = tl.load(policy_ptr + s)
+        off = s * r_size + p
+        cc = tl.load(const_cost_ptr + off)
+        rp = tl.load(r_pred_ptr + off)
+        i0 = tl.load(t0_ptr + off)
+        i1 = tl.load(t1_ptr + off)
+        i2 = tl.load(t2_ptr + off)
+        i3 = tl.load(t3_ptr + off)
+        v0 = tl.load(state_ptr + i0)
+        v1 = tl.load(state_ptr + i1)
+        v2 = tl.load(state_ptr + i2)
+        v3 = tl.load(state_ptr + i3)
+        av = cc + discount * (
+            (1.0 - rp) * v0 + rp * rrp0 * v1 + rp * rrp1 * v2 + rp * rrp2 * v3
+        )
+        s_old = tl.load(state_ptr + s)
+        tl.store(new_state_ptr + s, tl.minimum(s_old, av))
+
+    @triton.jit
     def _bellman_step_kernel_batched(
         state_ptr,  # (B, n_states) flat: state[b*n_states + s]
         const_cost_ptr,  # (B, n_states, r_size) flat
@@ -156,6 +243,110 @@ if HAS_TRITON:
         s_off = b * n_states + s
         s_old = tl.load(state_ptr + s_off, mask=b_mask, other=float("inf"))
         tl.store(new_state_ptr + s_off, tl.minimum(s_old, row_min), mask=b_mask)
+
+    @triton.jit
+    def _bellman_greedy_kernel_batched(
+        state_ptr,
+        const_cost_ptr,
+        r_pred_ptr,
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,
+        new_state_ptr,
+        policy_ptr,  # (B, n_states) int32: per-set argmin action
+        n_states,
+        r_size,
+        n_sets,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+        B_BLOCK: tl.constexpr,
+        R_BLOCK: tl.constexpr,
+    ):
+        """Batched greedy backup for MPI: like ``_bellman_step_kernel_batched`` but ALSO
+        writes each set's argmin action ``policy[b, s]`` (sets share transitions/r_pred but
+        each has its own const_cost -> its own greedy action)."""
+        s = tl.program_id(0)
+        b = tl.arange(0, B_BLOCK)
+        r = tl.arange(0, R_BLOCK)
+        b_mask = b < n_sets
+        r_mask = r < r_size
+        mask2 = b_mask[:, None] & r_mask[None, :]
+        shared_off = s * r_size + r
+        rp = tl.load(r_pred_ptr + shared_off, mask=r_mask, other=0.0)
+        i0 = tl.load(t0_ptr + shared_off, mask=r_mask, other=0)
+        i1 = tl.load(t1_ptr + shared_off, mask=r_mask, other=0)
+        i2 = tl.load(t2_ptr + shared_off, mask=r_mask, other=0)
+        i3 = tl.load(t3_ptr + shared_off, mask=r_mask, other=0)
+        base_b = b[:, None] * n_states
+        cc_off = (b[:, None] * n_states + s) * r_size + r[None, :]
+        cc = tl.load(const_cost_ptr + cc_off, mask=mask2, other=float("inf"))
+        v0 = tl.load(state_ptr + base_b + i0[None, :], mask=mask2, other=0.0)
+        v1 = tl.load(state_ptr + base_b + i1[None, :], mask=mask2, other=0.0)
+        v2 = tl.load(state_ptr + base_b + i2[None, :], mask=mask2, other=0.0)
+        v3 = tl.load(state_ptr + base_b + i3[None, :], mask=mask2, other=0.0)
+        rp2 = rp[None, :]
+        av = cc + discount * (
+            (1.0 - rp2) * v0 + rp2 * rrp0 * v1 + rp2 * rrp1 * v2 + rp2 * rrp2 * v3
+        )
+        av = tl.where(mask2, av, float("inf"))
+        row_min = tl.min(av, axis=1)
+        pol = tl.argmin(av, axis=1)
+        s_off = b * n_states + s
+        s_old = tl.load(state_ptr + s_off, mask=b_mask, other=float("inf"))
+        tl.store(new_state_ptr + s_off, tl.minimum(s_old, row_min), mask=b_mask)
+        tl.store(policy_ptr + s_off, pol, mask=b_mask)
+
+    @triton.jit
+    def _policy_eval_kernel_batched(
+        state_ptr,
+        const_cost_ptr,
+        r_pred_ptr,
+        t0_ptr,
+        t1_ptr,
+        t2_ptr,
+        t3_ptr,
+        policy_ptr,
+        new_state_ptr,
+        n_states,
+        r_size,
+        n_sets,
+        rrp0,
+        rrp1,
+        rrp2,
+        discount,
+        B_BLOCK: tl.constexpr,
+    ):
+        """Batched fixed-policy evaluation (MPI): each set uses its own greedy action
+        ``policy[b, s]`` (1 gather/branch, no R loop). Transitions/r_pred are shared but
+        indexed by each set's own action."""
+        s = tl.program_id(0)
+        b = tl.arange(0, B_BLOCK)
+        b_mask = b < n_sets
+        s_off = b * n_states + s
+        pol = tl.load(
+            policy_ptr + s_off, mask=b_mask, other=0
+        )  # (B_BLOCK,) per-set action
+        shared_off = s * r_size + pol  # (B_BLOCK,) per-set into shared arrays
+        rp = tl.load(r_pred_ptr + shared_off, mask=b_mask, other=0.0)
+        i0 = tl.load(t0_ptr + shared_off, mask=b_mask, other=0)
+        i1 = tl.load(t1_ptr + shared_off, mask=b_mask, other=0)
+        i2 = tl.load(t2_ptr + shared_off, mask=b_mask, other=0)
+        i3 = tl.load(t3_ptr + shared_off, mask=b_mask, other=0)
+        cc_off = (b * n_states + s) * r_size + pol
+        cc = tl.load(const_cost_ptr + cc_off, mask=b_mask, other=float("inf"))
+        base_b = b * n_states
+        v0 = tl.load(state_ptr + base_b + i0, mask=b_mask, other=0.0)
+        v1 = tl.load(state_ptr + base_b + i1, mask=b_mask, other=0.0)
+        v2 = tl.load(state_ptr + base_b + i2, mask=b_mask, other=0.0)
+        v3 = tl.load(state_ptr + base_b + i3, mask=b_mask, other=0.0)
+        av = cc + discount * (
+            (1.0 - rp) * v0 + rp * rrp0 * v1 + rp * rrp1 * v2 + rp * rrp2 * v3
+        )
+        s_old = tl.load(state_ptr + s_off, mask=b_mask, other=float("inf"))
+        tl.store(new_state_ptr + s_off, tl.minimum(s_old, av), mask=b_mask)
 
 
 # ── Grid constants (FSRS-7) ──────────────────────────────────────────────────
@@ -236,6 +427,7 @@ class SSPMMCSolver7:
         engine="auto",
         d_state=None,
         s_state=None,
+        mpi_eval=20,
     ):
         # Per-user inputs (CLAUDE.md: per-user FSRS params + per-button costs + H/G/E probs).
         self.review_costs = np.asarray(review_costs, dtype=np.float64)
@@ -247,6 +439,10 @@ class SSPMMCSolver7:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.n_s = n_s
+        # Modified Policy Iteration: number of cheap fixed-policy evaluation sweeps per greedy
+        # backup (0 => plain value iteration). MPI converges to the same unique V* in ~r_size x
+        # fewer expensive greedy sweeps; benchmarked ~7x in experiments/accel_bench7.py.
+        self.mpi_eval = int(mpi_eval)
         # Optional non-uniform difficulty grid (e.g. fine at the extremes, coarse in the
         # flat middle). None -> the default uniform D_EPS grid.
         self._custom_d_state = (
@@ -499,7 +695,10 @@ class SSPMMCSolver7:
 
     def _run_iteration_triton(self, const_cost, n_iter, convergence_tol):
         """Fused value iteration via ``_bellman_step_kernel`` (no action-value array). Ping-
-        pongs two ``state`` buffers (Jacobi backup: all reads from the previous iterate)."""
+        pongs two ``state`` buffers (Jacobi backup: all reads from the previous iterate).
+        With ``self.mpi_eval > 0`` runs Modified Policy Iteration instead (same V*, faster)."""
+        if self.mpi_eval > 0:
+            return self._run_iteration_triton_mpi(const_cost, n_iter, convergence_tol)
         rrp = self.review_rating_prob
         rrp0, rrp1, rrp2 = float(rrp[0]), float(rrp[1]), float(rrp[2])
         const_cost = const_cost.contiguous()
@@ -529,16 +728,81 @@ class SSPMMCSolver7:
                 DISCOUNT_FACTOR,
                 R_BLOCK=r_block,
             )
-            check_interval = 10 if it <= 100 else 25
+            check_interval = 1 if it <= 15 else 3
             if it % check_interval == 0:
                 cost_diff = (state - new_state).max().item()
             state, new_state = new_state, state
         return state, it, cost_diff
 
+    def _run_iteration_triton_mpi(self, const_cost, n_iter, convergence_tol):
+        """Triton Modified Policy Iteration: per outer step, one greedy kernel (value + argmin
+        policy) then ``self.mpi_eval`` cheap policy-eval kernels (1 action/state). Uniform
+        upper-bound init; ping-pongs ``state``/``new_state``. ``it`` counts greedy sweeps."""
+        rrp = self.review_rating_prob
+        rrp0, rrp1, rrp2 = float(rrp[0]), float(rrp[1]), float(rrp[2])
+        const_cost = const_cost.contiguous()
+        t0, t1, t2, t3 = self._transitions
+        upper = float(const_cost.max()) / (1.0 - DISCOUNT_FACTOR)
+        state = torch.full_like(self._state_init, upper)
+        state[self._state_init == 0.0] = 0.0  # terminal boundary
+        new_state = torch.empty_like(state)
+        policy = torch.empty(self.n_states, dtype=torch.int32, device=self.device)
+        r_block = triton.next_power_of_2(self.r_size)
+        grid = (self.n_states,)
+        it = 0
+        cost_diff = 1e9
+        while it < n_iter and cost_diff > convergence_tol:
+            it += 1
+            _bellman_greedy_kernel[grid](
+                state,
+                const_cost,
+                self._r_pred_flat,
+                t0,
+                t1,
+                t2,
+                t3,
+                new_state,
+                policy,
+                self.n_states,
+                self.r_size,
+                rrp0,
+                rrp1,
+                rrp2,
+                DISCOUNT_FACTOR,
+                R_BLOCK=r_block,
+            )
+            cost_diff = (state - new_state).max().item()
+            state, new_state = new_state, state
+            if cost_diff <= convergence_tol:
+                break
+            for _ in range(self.mpi_eval):
+                _policy_eval_kernel[grid](
+                    state,
+                    const_cost,
+                    self._r_pred_flat,
+                    t0,
+                    t1,
+                    t2,
+                    t3,
+                    policy,
+                    new_state,
+                    self.n_states,
+                    self.r_size,
+                    rrp0,
+                    rrp1,
+                    rrp2,
+                    DISCOUNT_FACTOR,
+                )
+                state, new_state = new_state, state
+        return state, it, cost_diff
+
     def _run_iteration_eager(self, const_cost, n_iter, convergence_tol):
         """Eager (CPU / no-Triton) value iteration: ``addcmul_`` to fuse ``prob*gather``
         into the accumulate, ``amin`` for the action min. Casts int32 transitions to int64
-        for torch advanced indexing."""
+        for torch advanced indexing. With ``self.mpi_eval > 0`` runs Modified Policy
+        Iteration instead (same V*, far fewer expensive sweeps)."""
+        if self.mpi_eval > 0:
+            return self._run_iteration_eager_mpi(const_cost, n_iter, convergence_tol)
         branch_probs = self._branch_probs()
         transitions = [t.long() for t in self._transitions]
         state = self._state_init.clone()
@@ -550,13 +814,50 @@ class SSPMMCSolver7:
             for prob, trans in zip(branch_probs, transitions):
                 action_value.addcmul_(prob, state[trans], value=DISCOUNT_FACTOR)
             optimal_value = torch.amin(action_value, dim=-1)
-            check_interval = 10 if it <= 100 else 25
+            check_interval = 1 if it <= 15 else 3
             if it % check_interval == 0:
                 new_state = torch.minimum(state, optimal_value)
                 cost_diff = (state - new_state).max().item()
                 state = new_state
             else:
                 torch.minimum(state, optimal_value, out=state)
+        return state, it, cost_diff
+
+    def _run_iteration_eager_mpi(self, const_cost, n_iter, convergence_tol):
+        """Eager Modified Policy Iteration. Each outer step: one full greedy backup (value +
+        argmin policy) then ``self.mpi_eval`` cheap fixed-policy evaluation sweeps (1 action
+        per state, ~r_size x cheaper) that propagate value across transition-hops fast.
+        Starts from a tight uniform upper bound max(const_cost)/(1-gamma) >= V* (skips the
+        COST_MAX collapse). Stays an upper bound via min(), so it converges to the SAME unique
+        V*. ``it`` counts greedy sweeps."""
+        branch_probs = self._branch_probs()
+        transitions = [t.long() for t in self._transitions]
+        idx = torch.arange(self.n_states, device=self.device)
+        upper = float(const_cost.max()) / (1.0 - DISCOUNT_FACTOR)
+        state = torch.full_like(self._state_init, upper)
+        state[self._state_init == 0.0] = 0.0  # terminal boundary stays 0
+        it = 0
+        cost_diff = 1e9
+        while it < n_iter and cost_diff > convergence_tol:
+            it += 1
+            action_value = const_cost.clone()
+            for prob, trans in zip(branch_probs, transitions):
+                action_value.addcmul_(prob, state[trans], value=DISCOUNT_FACTOR)
+            optimal_value, policy = torch.min(action_value, dim=-1)
+            new_state = torch.minimum(state, optimal_value)
+            cost_diff = (state - new_state).max().item()
+            state = new_state
+            if cost_diff <= convergence_tol:
+                break
+            # Cheap policy evaluation: reuse the greedy action per state (1 gather/branch).
+            cc_p = const_cost[idx, policy]
+            prob_p = [prob[idx, policy] for prob in branch_probs]
+            trans_p = [trans[idx, policy] for trans in transitions]
+            for _ in range(self.mpi_eval):
+                ev = cc_p.clone()
+                for prob, trans in zip(prob_p, trans_p):
+                    ev.addcmul_(prob, state[trans], value=DISCOUNT_FACTOR)
+                torch.minimum(state, ev, out=state)
         return state, it, cost_diff
 
     def _argmin_action(self, const_cost, state):
@@ -617,31 +918,86 @@ class SSPMMCSolver7:
             new_state = torch.empty_like(state)
             it = 0
             cost_diff = 1e9
-            while it < n_iter and cost_diff > convergence_tol:
-                it += 1
-                _bellman_step_kernel_batched[grid](
-                    state,
-                    const_cost,
-                    self._r_pred_flat,
-                    t0,
-                    t1,
-                    t2,
-                    t3,
-                    new_state,
-                    n_states,
-                    r_size,
-                    b,
-                    rrp0,
-                    rrp1,
-                    rrp2,
-                    DISCOUNT_FACTOR,
-                    B_BLOCK=b_block,
-                    R_BLOCK=r_block,
+            if self.mpi_eval > 0:
+                # Modified Policy Iteration. COST_MAX init kept (NOT the uniform upper bound)
+                # so the frac-at-max convergence verdict is identical to plain VI: unreachable
+                # states stay pinned at the init = the max, which is what frac measures.
+                policy = torch.empty(
+                    (b, n_states), dtype=torch.int32, device=self.device
                 )
-                check_interval = 10 if it <= 100 else 25
-                if it % check_interval == 0:
+                while it < n_iter and cost_diff > convergence_tol:
+                    it += 1
+                    _bellman_greedy_kernel_batched[grid](
+                        state,
+                        const_cost,
+                        self._r_pred_flat,
+                        t0,
+                        t1,
+                        t2,
+                        t3,
+                        new_state,
+                        policy,
+                        n_states,
+                        r_size,
+                        b,
+                        rrp0,
+                        rrp1,
+                        rrp2,
+                        DISCOUNT_FACTOR,
+                        B_BLOCK=b_block,
+                        R_BLOCK=r_block,
+                    )
                     cost_diff = (state - new_state).max().item()
-                state, new_state = new_state, state
+                    state, new_state = new_state, state
+                    if cost_diff <= convergence_tol:
+                        break
+                    for _ in range(self.mpi_eval):
+                        _policy_eval_kernel_batched[grid](
+                            state,
+                            const_cost,
+                            self._r_pred_flat,
+                            t0,
+                            t1,
+                            t2,
+                            t3,
+                            policy,
+                            new_state,
+                            n_states,
+                            r_size,
+                            b,
+                            rrp0,
+                            rrp1,
+                            rrp2,
+                            DISCOUNT_FACTOR,
+                            B_BLOCK=b_block,
+                        )
+                        state, new_state = new_state, state
+            else:
+                while it < n_iter and cost_diff > convergence_tol:
+                    it += 1
+                    _bellman_step_kernel_batched[grid](
+                        state,
+                        const_cost,
+                        self._r_pred_flat,
+                        t0,
+                        t1,
+                        t2,
+                        t3,
+                        new_state,
+                        n_states,
+                        r_size,
+                        b,
+                        rrp0,
+                        rrp1,
+                        rrp2,
+                        DISCOUNT_FACTOR,
+                        B_BLOCK=b_block,
+                        R_BLOCK=r_block,
+                    )
+                    check_interval = 1 if it <= 15 else 3
+                    if it % check_interval == 0:
+                        cost_diff = (state - new_state).max().item()
+                    state, new_state = new_state, state
             results = []
             for i in range(b):
                 sb = state[i]

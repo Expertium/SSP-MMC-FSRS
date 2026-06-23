@@ -67,6 +67,8 @@ def main():
             first_rating_prob=u["first_rating_prob"],
             review_rating_prob=u["review_rating_prob"],
             w=w,
+            mpi_eval=0,  # this test validates the PLAIN value-iteration kernels (eager vs
+            # triton); MPI parity has its own test (tests/test_solver7_mpi_parity.py).
         )
         for hp in hp_sets:
             n_pairs += 1
