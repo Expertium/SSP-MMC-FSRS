@@ -184,6 +184,15 @@ Implications:
 2. When code changes affect the README examples, **update `README.md`**.
 3. Before each commit, run **`uv run ruff format`**.
 4. Commit messages must follow **Conventional Commits** (see below).
+5. **GPU jobs — watch VRAM *and* utilization.** For anything that runs on the GPU (today
+   the Bellman solver; later the GRU/LSTM p(recall) predictor inside the simulator), check
+   **both** `nvidia-smi` VRAM usage **and** `% GPU utilization`. If **both are low**, the job
+   is under-using the GPU and can almost certainly be sped up — e.g. more parallelism (batch
+   more work, or run several processes on disjoint partitions to fill the idle GPU). On
+   Windows/WDDM `nvidia-smi` can't show per-process VRAM; use
+   `Get-Counter '\GPU Process Memory(*)\Dedicated Usage'`. Note `torch.cuda.max_memory_allocated`
+   under-reports the true process footprint by ~2× (it omits reserved/cached blocks + the
+   CUDA context). See memory [[gpu-utilization-watch]].
 
 ### Conventional Commits
 Structure a commit message as:
