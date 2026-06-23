@@ -394,10 +394,15 @@ def build_hybrid_s_grid(n_linear=5, n_log=66, skew=0.4, lin_max=0.1):
     uniform 135-pt log grid on memorized at ~3x fewer states (see memory grid-fineness-findings).
     """
     lin = np.linspace(S_MIN, lin_max, n_linear)
-    u = np.arange(n_log) / (n_log - 1)
+    # n_log power-skewed log points STRICTLY above lin_max, so 0.1 (the linear segment's last
+    # point) is NOT duplicated by the log segment's first point: take n_log+1 nodes on
+    # [lin_max, S_MAX] and drop the first (which == lin_max). skew<1 packs toward high S.
+    u = np.arange(n_log + 1) / n_log
     v = u**skew
-    logp = np.exp(np.log(lin_max) + v * (np.log(S_MAX) - np.log(lin_max)))
-    s = np.unique(np.concatenate([lin, logp]))  # sorted + strictly increasing
+    logp = np.exp(np.log(lin_max) + v * (np.log(S_MAX) - np.log(lin_max)))[1:]
+    s = np.concatenate(
+        [lin, logp]
+    )  # distinct by construction; sorted + strictly increasing
     s[-1] = S_MAX
     return s
 
