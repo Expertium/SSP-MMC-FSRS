@@ -196,6 +196,31 @@ def build_s_grid(s_min=S_MIN, s_max=S_MAX, n=N_S, increment_min=S_INCREMENT_MIN)
     return s
 
 
+def build_hybrid_s_grid(n_linear=5, n_log=66, skew=0.4, lin_max=0.1):
+    """PRODUCTION S grid: linear over [S_MIN, lin_max] spliced to a power-skewed log region
+    over [lin_max, S_MAX]. ``skew<1`` packs the log points toward high S. The default
+    (5, 66, 0.4) -> 71 points was chosen by the grid-fineness experiments: it matches/beats a
+    uniform 135-pt log grid on memorized at ~3x fewer states (see memory grid-fineness-findings).
+    """
+    lin = np.linspace(S_MIN, lin_max, n_linear)
+    u = np.arange(n_log) / (n_log - 1)
+    v = u**skew
+    logp = np.exp(np.log(lin_max) + v * (np.log(S_MAX) - np.log(lin_max)))
+    s = np.unique(np.concatenate([lin, logp]))  # sorted + strictly increasing
+    s[-1] = S_MAX
+    return s
+
+
+def build_production_d_grid():
+    """PRODUCTION difficulty grid: [1,2]@0.1 + [2,9]@0.5 + [9,10]@0.1 = 35 points -- fine at
+    the extremes (where the optimal policy is most D-sensitive), coarse in the flat middle.
+    Beats the uniform 91-pt grid's compute by ~2.6x at ~1.4% memorized error vs the 225 ref."""
+    seg1 = np.round(np.arange(1.0, 2.0 + 1e-9, 0.1), 4)
+    seg2 = np.round(np.arange(2.0, 9.0 + 1e-9, 0.5), 4)
+    seg3 = np.round(np.arange(9.0, 10.0 + 1e-9, 0.1), 4)
+    return np.unique(np.concatenate([seg1, seg2, seg3]))
+
+
 class SSPMMCSolver7:
     """FSRS-7 SSP-MMC solver: 3-D state, dual-stability transitions, per-user inputs."""
 
