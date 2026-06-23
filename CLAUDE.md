@@ -178,6 +178,20 @@ Implications:
 
 ## Working conventions
 
+### Design constraints (what eventually ships in Anki)
+GPU is fully fine for experiments — we use it heavily. The constraints only concern what
+eventually runs **inside Anki, on each user's own device**:
+- **Ships in Anki** (must be **per-individual-user** + eventually **ported to Rust**): the
+  **Bellman solver** and **SSP-MMC as a scheduling policy** (if simulations show it's good).
+- **Experiment-only** (GPU always fine, never in Anki): the **GRU/LSTM** p(recall) predictors.
+
+So: (1) Anki-bound code must work for one user with only *their own* data — **no cross-user
+warm starts** (a *constant* baked-in init is fine). (2) For the solver, **prefer portable
+algorithmic wins** (Anderson acceleration, better init, closed-form inverse, fewer
+iterations). GPU/CUDA-only speedups (bf16, Triton kernels) are fine as a **bonus fast path**
+but not worth heavy effort unless the gain is spectacular — they won't port to Rust. See
+memory [[anki-deployment-constraints]].
+
 ### Project rules
 1. Manage the project environment with **`uv`**: `uv sync` (base) /
    `uv sync --extra experiments` (experiments need the extra dependencies).
