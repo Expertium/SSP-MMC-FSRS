@@ -15,8 +15,10 @@
 //!
 //! Params are per-deck (the `parallel` axis = users): `w` is `(parallel, 34)`.
 
+use std::time::Instant;
+
 use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -33,6 +35,7 @@ enum Policy {
     Dr,
     Memrise,
     Sm2,
+    SspMmc,
 }
 
 #[inline]
@@ -42,6 +45,25 @@ fn categorical(u: f64, cum: &[f64]) -> usize {
         k += 1;
     }
     k
+}
+
+/// Stability -> grid index: first index with grid[i] >= s, clamped (matches solver7.s2i,
+/// np.searchsorted 'left').
+#[inline]
+pub(crate) fn s2i(grid: &[f64], s: f64) -> usize {
+    grid.partition_point(|&g| g < s).min(grid.len() - 1)
+}
+
+/// Difficulty -> grid index: nearest grid point (matches solver7.d2i non-uniform branch).
+#[inline]
+pub(crate) fn d2i(grid: &[f64], d: f64) -> usize {
+    let hi = grid.partition_point(|&g| g < d).min(grid.len() - 1);
+    let lo = hi.saturating_sub(1);
+    if (grid[hi] - d).abs() <= (d - grid[lo]).abs() {
+        hi
+    } else {
+        lo
+    }
 }
 
 #[inline]
@@ -75,7 +97,7 @@ fn short_component_recall(t: f64, s_short: f64, w: &[f64]) -> f64 {
 }
 
 #[inline]
-fn forgetting_curve(t: f64, s: f64, s_short: f64, d: f64, w: &[f64]) -> f64 {
+pub(crate) fn forgetting_curve(t: f64, s: f64, s_short: f64, d: f64, w: &[f64]) -> f64 {
     let t = t.max(0.0);
     let r1 = short_component_recall(t, s_short, w);
     let decay2 = -(w[24].clamp(0.01, 0.95));
@@ -139,7 +161,7 @@ fn init_state(rating: i64, w: &[f64], s_min: f64) -> (f64, f64, f64) {
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn update_state(
+pub(crate) fn update_state(
     dt: f64,
     rating: i64,
     s_long: f64,
@@ -172,7 +194,7 @@ fn update_state(
 /// Interval at which recall == `dr`, by Brent's method in log(t) (f64 port of
 /// fsrs7.forgetting_curve_inverse). Result in [min_t, max_t].
 #[allow(clippy::too_many_arguments)]
-fn forgetting_curve_inverse(
+pub(crate) fn forgetting_curve_inverse(
     dr: f64,
     s_long: f64,
     s_short: f64,
@@ -260,8 +282,166 @@ fn forgetting_curve_inverse(
     b.clamp(log_min, log_max).exp()
 }
 
+// ── GRU pseudo-ground-truth recall predictor (f64 port of ssp_mmc_fsrs/gru.py) ──────
+// Per-user weights arrive as one flat row (BatchedGRU.FLAT_ORDER / FLAT_LEN). The GRU is
+// tiny (7 hidden) so a scalar f64 implementation is fastest, and it matches the Python
+// BatchedGRU to ~1e-15 (identical math). Only nn.GRU is recurrent, so we carry h per card.
+const GRU_FLAT_LEN: usize = 505;
+
+#[inline]
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+#[inline]
+fn silu(x: f64) -> f64 {
+    x * sigmoid(x)
+}
+#[inline]
+fn layernorm7(x: &[f64; 7], gamma: &[f64; 7]) -> [f64; 7] {
+    let mean = x.iter().sum::<f64>() / 7.0;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 7.0;
+    let inv = 1.0 / (var + 1e-5).sqrt();
+    let mut o = [0.0; 7];
+    for i in 0..7 {
+        o[i] = (x[i] - mean) * inv * gamma[i];
+    }
+    o
+}
+#[inline]
+fn rd<const N: usize>(r: &[f64], o: &mut usize) -> [f64; N] {
+    let mut a = [0.0; N];
+    a.copy_from_slice(&r[*o..*o + N]);
+    *o += N;
+    a
+}
+
+struct GruW {
+    pre_w: [f64; 35], pre_b: [f64; 7], ln_pre: [f64; 7],
+    w_ih: [f64; 147], w_hh: [f64; 147], b_ih: [f64; 21], b_hh: [f64; 21],
+    ln_post1: [f64; 7], post_w: [f64; 49], post_b: [f64; 7], ln_post2: [f64; 7],
+    w_fc_w: [f64; 14], w_fc_b: [f64; 2], s_fc_w: [f64; 14], s_fc_b: [f64; 2],
+    d_fc_w: [f64; 14], d_fc_b: [f64; 2], input_mean: f64, input_std: f64,
+}
+
+impl GruW {
+    fn from_row(r: &[f64]) -> GruW {
+        // Fields are evaluated top-to-bottom, so the shared offset reads them in order.
+        let mut o = 0usize;
+        GruW {
+            pre_w: rd::<35>(r, &mut o), pre_b: rd::<7>(r, &mut o), ln_pre: rd::<7>(r, &mut o),
+            w_ih: rd::<147>(r, &mut o), w_hh: rd::<147>(r, &mut o),
+            b_ih: rd::<21>(r, &mut o), b_hh: rd::<21>(r, &mut o),
+            ln_post1: rd::<7>(r, &mut o), post_w: rd::<49>(r, &mut o),
+            post_b: rd::<7>(r, &mut o), ln_post2: rd::<7>(r, &mut o),
+            w_fc_w: rd::<14>(r, &mut o), w_fc_b: rd::<2>(r, &mut o),
+            s_fc_w: rd::<14>(r, &mut o), s_fc_b: rd::<2>(r, &mut o),
+            d_fc_w: rd::<14>(r, &mut o), d_fc_b: rd::<2>(r, &mut o),
+            input_mean: {
+                let v = r[o];
+                o += 1;
+                v
+            },
+            input_std: r[o],
+        }
+    }
+
+    #[inline]
+    fn features(&self, dt: f64, rating: i64) -> [f64; 5] {
+        let mut x = [0.0; 5];
+        x[0] = ((1e-5 + dt).ln() - self.input_mean) / self.input_std;
+        x[1 + (rating.clamp(1, 4) - 1) as usize] = 1.0; // rating one-hot
+        x
+    }
+
+    /// Advance the hidden state by one review (dt, rating). Mirrors BatchedGRU.step.
+    #[inline]
+    fn step(&self, h: &[f64; 7], dt: f64, rating: i64) -> [f64; 7] {
+        let x = self.features(dt, rating);
+        let mut a = [0.0; 7];
+        for o in 0..7 {
+            let mut s = self.pre_b[o];
+            for i in 0..5 {
+                s += self.pre_w[o * 5 + i] * x[i];
+            }
+            a[o] = silu(s);
+        }
+        let c = layernorm7(&a, &self.ln_pre);
+        let mut hn = [0.0; 7];
+        for i in 0..7 {
+            // GRU gate order: reset (0..7), update (7..14), new (14..21).
+            let (mut gir, mut giz, mut gin) = (self.b_ih[i], self.b_ih[7 + i], self.b_ih[14 + i]);
+            let (mut ghr, mut ghz, mut ghn) = (self.b_hh[i], self.b_hh[7 + i], self.b_hh[14 + i]);
+            for k in 0..7 {
+                gir += self.w_ih[i * 7 + k] * c[k];
+                giz += self.w_ih[(7 + i) * 7 + k] * c[k];
+                gin += self.w_ih[(14 + i) * 7 + k] * c[k];
+                ghr += self.w_hh[i * 7 + k] * h[k];
+                ghz += self.w_hh[(7 + i) * 7 + k] * h[k];
+                ghn += self.w_hh[(14 + i) * 7 + k] * h[k];
+            }
+            let rg = sigmoid(gir + ghr);
+            let zg = sigmoid(giz + ghz);
+            let ng = (gin + rg * ghn).tanh();
+            hn[i] = (1.0 - zg) * ng + zg * h[i];
+        }
+        hn
+    }
+
+    /// 2-curve forgetting-curve params (w, s, d) from the hidden state.
+    #[inline]
+    fn curve(&self, h: &[f64; 7]) -> ([f64; 2], [f64; 2], [f64; 2]) {
+        let g1 = layernorm7(h, &self.ln_post1);
+        let mut e = [0.0; 7];
+        for o in 0..7 {
+            let mut s = self.post_b[o];
+            for i in 0..7 {
+                s += self.post_w[o * 7 + i] * g1[i];
+            }
+            e[o] = silu(s);
+        }
+        let gg = layernorm7(&e, &self.ln_post2);
+        let (mut wl, mut sl, mut dl) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+        for o in 0..2 {
+            let (mut sw, mut ss, mut sd) = (self.w_fc_b[o], self.s_fc_b[o], self.d_fc_b[o]);
+            for i in 0..7 {
+                sw += self.w_fc_w[o * 7 + i] * gg[i];
+                ss += self.s_fc_w[o * 7 + i] * gg[i];
+                sd += self.d_fc_w[o * 7 + i] * gg[i];
+            }
+            wl[o] = sw;
+            sl[o] = ss;
+            dl[o] = sd;
+        }
+        let m = wl[0].max(wl[1]); // stable softmax over the 2 curves
+        let (e0, e1) = ((wl[0] - m).exp(), (wl[1] - m).exp());
+        let zz = e0 + e1;
+        (
+            [e0 / zz, e1 / zz],
+            [sl[0].clamp(-25.0, 25.0).exp(), sl[1].clamp(-25.0, 25.0).exp()],
+            [dl[0].clamp(-25.0, 25.0).exp(), dl[1].clamp(-25.0, 25.0).exp()],
+        )
+    }
+
+    /// p(recall) after elapsed dt, given hidden state h. Mirrors BatchedGRU.p_recall.
+    #[inline]
+    fn p_recall(&self, h: &[f64; 7], dt: f64) -> f64 {
+        let (wc, sc, dc) = self.curve(h);
+        let mut r = 0.0;
+        for k in 0..2 {
+            r += wc[k] * (1.0 + dt / (1e-7 + sc[k])).powf(-dc[k]);
+        }
+        (1.0 - 1e-7) * r
+    }
+}
+
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    parallel, deck_size, learn_span, seed, w, learn_costs, review_costs,
+    first_rating_prob, review_rating_prob, max_cost_perday, learn_limit_perday,
+    review_limit_perday, s_min, s_max, max_same_day, n_iter, policy, policy_param,
+    gru_weights=None, retention_table=None, s_grid=None, d_grid=None,
+))]
 pub fn simulate_fsrs7<'py>(
     py: Python<'py>,
     parallel: usize,
@@ -282,20 +462,29 @@ pub fn simulate_fsrs7<'py>(
     n_iter: usize,
     policy: &str,
     policy_param: f64,
+    gru_weights: Option<PyReadonlyArray2<'py, f64>>,
+    // SSP-MMC policy inputs (policy == "ssp_mmc"): per-user target-retention table flattened
+    // [d, s_long, s_short] -> (parallel, d_size*s_size*s_size), plus the solver's s/d grids.
+    retention_table: Option<PyReadonlyArray2<'py, f64>>,
+    s_grid: Option<PyReadonlyArray1<'py, f64>>,
+    d_grid: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<(
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
     Bound<'py, PyArray2<f64>>,
+    f64, // t_fsrs: seconds in FSRS-7 math (update_state, curve, curve-inverse, SSP lookup)
+    f64, // t_gru: seconds in GRU inference (p_recall, step)
 )> {
     let pol = match policy {
         "fixed" => Policy::Fixed,
         "dr" => Policy::Dr,
         "memrise" => Policy::Memrise,
         "sm2" => Policy::Sm2,
+        "ssp_mmc" => Policy::SspMmc,
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown policy {other:?} (use 'fixed', 'dr', 'memrise', or 'sm2')"
+                "unknown policy {other:?} (use fixed/dr/memrise/sm2/ssp_mmc)"
             )));
         }
     };
@@ -305,6 +494,39 @@ pub fn simulate_fsrs7<'py>(
     let review_costs = review_costs.as_array();
     let first_rating_prob = first_rating_prob.as_array();
     let review_rating_prob = review_rating_prob.as_array();
+
+    // Optional GRU pseudo-ground-truth recall predictor: when supplied, the GRU decides
+    // recall + the recorded knowledge; FSRS-7 still schedules. Per-user weights are one
+    // flat (parallel, GRU_FLAT_LEN) row each (BatchedGRU.flat_weights()).
+    let gru_view = gru_weights.as_ref().map(|g| g.as_array());
+    if let Some(gv) = &gru_view {
+        if gv.shape() != [parallel, GRU_FLAT_LEN] {
+            return Err(PyValueError::new_err(format!(
+                "gru_weights must be ({parallel}, {GRU_FLAT_LEN}), got {:?}",
+                gv.shape()
+            )));
+        }
+    }
+
+    // SSP-MMC: grids (shared across users) + per-user retention table.
+    let sgrid_v: Option<Vec<f64>> = s_grid.as_ref().map(|g| g.as_array().to_vec());
+    let dgrid_v: Option<Vec<f64>> = d_grid.as_ref().map(|g| g.as_array().to_vec());
+    let ret_view = retention_table.as_ref().map(|r| r.as_array());
+    if matches!(pol, Policy::SspMmc) {
+        let ok = match (&sgrid_v, &dgrid_v, &ret_view) {
+            (Some(sg), Some(dg), Some(rv)) => {
+                rv.shape() == [parallel, sg.len() * sg.len() * dg.len()]
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(PyValueError::new_err(
+                "policy 'ssp_mmc' requires retention_table (parallel, d*s*s), s_grid, d_grid",
+            ));
+        }
+    }
+    let mut t_fsrs_ns: u128 = 0;
+    let mut t_gru_ns: u128 = 0;
 
     let mut review_cnt = Array2::<f64>::zeros((parallel, learn_span));
     let mut learn_cnt = Array2::<f64>::zeros((parallel, learn_span));
@@ -359,22 +581,48 @@ pub fn simulate_fsrs7<'py>(
             first_rating[c] = (categorical(rng::uniform(cell, seed), &cum_first) + 1) as i64;
         }
 
+        // GRU predictor state for this user (if enabled): per-user weights + per-card hidden h.
+        let gw = gru_view.as_ref().map(|gv| {
+            let row: Vec<f64> = (0..GRU_FLAT_LEN).map(|i| gv[[p, i]]).collect();
+            GruW::from_row(&row)
+        });
+        let mut hgru: Vec<[f64; 7]> = if gw.is_some() {
+            vec![[0.0; 7]; deck_size]
+        } else {
+            Vec::new()
+        };
+        // SSP-MMC per-user target-retention table, flattened [d, s_long, s_short].
+        let ret_row: Option<Vec<f64>> = ret_view
+            .as_ref()
+            .map(|rv| (0..rv.shape()[1]).map(|i| rv[[p, i]]).collect());
+
         for today in 0..learn_span {
             let today_f = today as f64;
 
-            // memorized snapshot (start of day, learned cards)
+            // memorized snapshot (start of day, learned cards). The whole loop is one op
+            // class -- GRU p_recall when enabled, else FSRS forgetting_curve -- so block-time
+            // it (one Instant/day) to keep profiler overhead negligible.
+            let t_snap = Instant::now();
             let mut mem = 0.0f64;
             for c in 0..deck_size {
                 if s_long[c] > 0.0 {
                     let dt = (today_f - last_date[c]).max(0.0);
-                    mem += forgetting_curve(
-                        dt,
-                        s_long[c].clamp(s_min, s_max),
-                        s_short[c].clamp(s_min, s_max),
-                        diff[c].clamp(D_MIN, D_MAX),
-                        &wd,
-                    );
+                    mem += match &gw {
+                        Some(g) => g.p_recall(&hgru[c], dt),
+                        None => forgetting_curve(
+                            dt,
+                            s_long[c].clamp(s_min, s_max),
+                            s_short[c].clamp(s_min, s_max),
+                            diff[c].clamp(D_MIN, D_MAX),
+                            &wd,
+                        ),
+                    };
                 }
+            }
+            if gw.is_some() {
+                t_gru_ns += t_snap.elapsed().as_nanos();
+            } else {
+                t_fsrs_ns += t_snap.elapsed().as_nanos();
             }
             memorized[[p, today]] = mem;
 
@@ -417,13 +665,22 @@ pub fn simulate_fsrs7<'py>(
                     if rev_cand {
                         t_review = due[c].max(today_f);
                         dt = (t_review - last_date[c]).max(0.0);
-                        let r = forgetting_curve(
-                            dt,
-                            s_long[c].clamp(s_min, s_max),
-                            s_short[c].clamp(s_min, s_max),
-                            diff[c].clamp(D_MIN, D_MAX),
-                            &wd,
-                        );
+                        let t_r = Instant::now();
+                        let r = match &gw {
+                            Some(g) => g.p_recall(&hgru[c], dt),
+                            None => forgetting_curve(
+                                dt,
+                                s_long[c].clamp(s_min, s_max),
+                                s_short[c].clamp(s_min, s_max),
+                                diff[c].clamp(D_MIN, D_MAX),
+                                &wd,
+                            ),
+                        };
+                        if gw.is_some() {
+                            t_gru_ns += t_r.elapsed().as_nanos();
+                        } else {
+                            t_fsrs_ns += t_r.elapsed().as_nanos();
+                        }
                         let recalled = rng::uniform(base_forget + cell, seed) <= r;
                         rating = if recalled {
                             (categorical(rng::uniform(base_pass + cell, seed), &cum_review) + 2)
@@ -458,8 +715,10 @@ pub fn simulate_fsrs7<'py>(
 
                     // apply the memory update / init
                     if rev_cand {
+                        let t_us = Instant::now();
                         let (nsl, nss, nd) =
                             update_state(dt, rating, s_long[c], s_short[c], diff[c], &wd, s_min, s_max);
+                        t_fsrs_ns += t_us.elapsed().as_nanos();
                         s_long[c] = nsl;
                         s_short[c] = nss;
                         diff[c] = nd;
@@ -475,22 +734,48 @@ pub fn simulate_fsrs7<'py>(
                         day_learns += 1;
                     }
 
+                    // advance the GRU hidden state with the realized (dt, rating): learning
+                    // uses (dt = 0, first_rating); a review uses its elapsed dt and rev rating.
+                    if let Some(g) = &gw {
+                        let t_st = Instant::now();
+                        hgru[c] = g.step(&hgru[c], dt, rating);
+                        t_gru_ns += t_st.elapsed().as_nanos();
+                    }
+
                     // schedule the next interval / due
                     let is_learn = learn_cand;
                     let prev = if is_learn { 0.0 } else { ivl[c] };
                     let base_time = if is_learn { today_f } else { t_review };
                     let new_ivl: f64 = match pol {
                         Policy::Fixed => policy_param,
-                        Policy::Dr => forgetting_curve_inverse(
-                            policy_param,
-                            s_long[c],
-                            s_short[c],
-                            diff[c],
-                            &wd,
-                            n_iter,
-                            MIN_IVL,
-                            S_MAX,
-                        ),
+                        Policy::Dr => {
+                            let t_inv = Instant::now();
+                            let v = forgetting_curve_inverse(
+                                policy_param, s_long[c], s_short[c], diff[c], &wd, n_iter, MIN_IVL,
+                                S_MAX,
+                            );
+                            t_fsrs_ns += t_inv.elapsed().as_nanos();
+                            v
+                        }
+                        Policy::SspMmc => {
+                            // SSP-MMC: look up the optimal target retention for this state
+                            // (nearest grid cell), then invert the curve to an interval.
+                            let t_inv = Instant::now();
+                            let sg = sgrid_v.as_ref().unwrap();
+                            let dg = dgrid_v.as_ref().unwrap();
+                            let rt = ret_row.as_ref().unwrap();
+                            let ssz = sg.len();
+                            let sl_i = s2i(sg, s_long[c]);
+                            let ss_i = s2i(sg, s_short[c]);
+                            let d_i = d2i(dg, diff[c]);
+                            let target_r = rt[(d_i * ssz + sl_i) * ssz + ss_i];
+                            let v = forgetting_curve_inverse(
+                                target_r, s_long[c], s_short[c], diff[c], &wd, n_iter, MIN_IVL,
+                                S_MAX,
+                            );
+                            t_fsrs_ns += t_inv.elapsed().as_nanos();
+                            v
+                        }
                         Policy::Memrise => {
                             if prev == 0.0 || rating == 1 {
                                 MEMRISE7[0]
@@ -561,5 +846,7 @@ pub fn simulate_fsrs7<'py>(
         learn_cnt.into_pyarray(py),
         memorized.into_pyarray(py),
         cost_day.into_pyarray(py),
+        (t_fsrs_ns as f64) / 1e9,
+        (t_gru_ns as f64) / 1e9,
     ))
 }

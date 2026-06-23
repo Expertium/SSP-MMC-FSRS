@@ -11,18 +11,24 @@ scheduler (DR/fixed/Memrise/SM-2) and predictor (the dual forgetting curve).
 """
 
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 
 import ssp_mmc_rust
 from ssp_mmc_fsrs import fsrs7
+from ssp_mmc_fsrs.gru import BatchedGRU
 from ssp_mmc_fsrs.simulation7 import simulate, S_MIN_SECS
 from ssp_mmc_fsrs.policies7 import (
     create_fixed_interval_policy,
     create_dr_policy,
     make_memrise_policy,
     make_anki_sm2_policy,
+)
+
+WDIR = (
+    Path(__file__).resolve().parents[1] / "outputs" / "gru_weights" / "GRU-short-secs"
 )
 
 torch.set_num_threads(1)
@@ -125,6 +131,147 @@ def run(policy_name, py_policy, policy_param, parallel, deck_size, learn_span, s
     return py, rs
 
 
+def per_user_params(parallel, seed):
+    """Distinct REAL per-user (w, costs, probs) for users 1..parallel (the production case).
+
+    Uses fitted FSRS-7 params + measured costs/probs (well-behaved), so any Python<->Rust
+    divergence is a genuine per-user-plumbing bug, not pathological synthetic params.
+    """
+    import sys as _sys
+
+    _sys.path.insert(0, "experiments")
+    import lib  # type: ignore
+
+    fsrs7_path = "../srs-benchmark/result/FSRS-7-short-secs-recency.jsonl"
+    bu_path = "../Anki-button-usage/button_usage.jsonl"
+    ws, lcs, rcs, frp, rrp = [], [], [], [], []
+    for uid in range(1, parallel + 1):
+        w, _, _ = lib.load_fsrs_weights(fsrs7_path, uid)
+        u = lib.normalize_button_usage(lib.load_button_usage_config(bu_path, uid))
+        ws.append(np.asarray(w, dtype=np.float64))
+        lcs.append(u["learn_costs"])
+        rcs.append(u["review_costs"])
+        frp.append(u["first_rating_prob"])
+        rrp.append(u["review_rating_prob"])
+    out = [
+        np.ascontiguousarray(np.stack(a), dtype=np.float64)
+        for a in (ws, lcs, rcs, frp, rrp)
+    ]
+    return out
+
+
+def run_peruser(policy_name, policy_param, parallel, deck_size, learn_span, seed=42):
+    """Same as run() but each deck (user) gets its OWN params -- exercises per-user batching."""
+    ws, lcs, rcs, frp, rrp = per_user_params(parallel, seed)
+    py_policy = {
+        "fixed": create_fixed_interval_policy(policy_param),
+        "dr": create_dr_policy(policy_param, ws),  # per-user w -> (34, P, 1)
+        "memrise": make_memrise_policy(),
+        "sm2": make_anki_sm2_policy(),
+    }[policy_name]
+    py = simulate(
+        parallel=parallel,
+        w=ws,
+        policy=py_policy,
+        device="cpu",
+        deck_size=deck_size,
+        learn_span=learn_span,
+        max_cost_perday=MAX_COST,
+        learn_limit_perday=LEARN_LIMIT,
+        review_limit_perday=REVIEW_LIMIT,
+        learn_costs=lcs,
+        review_costs=rcs,
+        first_rating_prob=frp,
+        review_rating_prob=rrp,
+        seed=seed,
+        s_min=S_MIN_SECS,
+        s_max=S_MAX,
+        max_same_day=MAX_SAME_DAY,
+        rng_kind="shared",
+    )
+    rs = ssp_mmc_rust.simulate_fsrs7(
+        parallel,
+        deck_size,
+        learn_span,
+        int(seed),
+        ws,
+        lcs,
+        rcs,
+        frp,
+        rrp,
+        MAX_COST,
+        LEARN_LIMIT,
+        REVIEW_LIMIT,
+        float(S_MIN_SECS),
+        float(S_MAX),
+        MAX_SAME_DAY,
+        N_ITER,
+        policy_name,
+        float(policy_param),
+    )
+    return py, rs
+
+
+def run_peruser_gru(
+    policy_name, policy_param, parallel, deck_size, learn_span, seed=42
+):
+    """Per-user params AND the per-user GRU as the recall predictor. Python uses a
+    BatchedGRU; Rust uses the same weights via flat_weights() -> gru_weights."""
+    ws, lcs, rcs, frp, rrp = per_user_params(parallel, seed)
+    paths = [WDIR / f"user_{u}.pth" for u in range(1, parallel + 1)]
+    gru = BatchedGRU.from_pth_paths(paths, device="cpu", dtype=torch.float64)
+    py_policy = {
+        "fixed": create_fixed_interval_policy(policy_param),
+        "dr": create_dr_policy(policy_param, ws),
+        "memrise": make_memrise_policy(),
+        "sm2": make_anki_sm2_policy(),
+    }[policy_name]
+    py = simulate(
+        parallel=parallel,
+        w=ws,
+        policy=py_policy,
+        device="cpu",
+        deck_size=deck_size,
+        learn_span=learn_span,
+        max_cost_perday=MAX_COST,
+        learn_limit_perday=LEARN_LIMIT,
+        review_limit_perday=REVIEW_LIMIT,
+        learn_costs=lcs,
+        review_costs=rcs,
+        first_rating_prob=frp,
+        review_rating_prob=rrp,
+        seed=seed,
+        s_min=S_MIN_SECS,
+        s_max=S_MAX,
+        max_same_day=MAX_SAME_DAY,
+        rng_kind="shared",
+        gru=gru,
+    )
+    flat = np.ascontiguousarray(gru.flat_weights().cpu().numpy(), dtype=np.float64)
+    rs = ssp_mmc_rust.simulate_fsrs7(
+        parallel,
+        deck_size,
+        learn_span,
+        int(seed),
+        ws,
+        lcs,
+        rcs,
+        frp,
+        rrp,
+        MAX_COST,
+        LEARN_LIMIT,
+        REVIEW_LIMIT,
+        float(S_MIN_SECS),
+        float(S_MAX),
+        MAX_SAME_DAY,
+        N_ITER,
+        policy_name,
+        float(policy_param),
+        flat,
+    )
+    return py, rs
+
+
 def compare(py, rs):
     names = ["review", "learn", "memorized", "cost"]
     ok = True
@@ -178,6 +325,31 @@ def main():
             print(f"[{policy_name:8s}] {cfg}  ->  {'PASS' if ok else 'FAIL'}")
             for ln in lines:
                 print(ln)
+
+    print("\n--- per-user params (distinct w/costs/probs per deck) ---")
+    for policy_name, _, param in policies:
+        cfg = dict(parallel=6, deck_size=800, learn_span=160)
+        py, rs = run_peruser(policy_name, param, **cfg)
+        ok, lines = compare(py, rs)
+        all_ok = all_ok and ok
+        print(f"[{policy_name:8s} per-user] {cfg}  ->  {'PASS' if ok else 'FAIL'}")
+        for ln in lines:
+            print(ln)
+
+    if all(p.exists() for p in (WDIR / f"user_{u}.pth" for u in range(1, 7))):
+        print("\n--- per-user params + per-user GRU recall predictor ---")
+        for policy_name, _, param in policies:
+            cfg = dict(parallel=6, deck_size=600, learn_span=140)
+            py, rs = run_peruser_gru(policy_name, param, **cfg)
+            ok, lines = compare(py, rs)
+            all_ok = all_ok and ok
+            print(f"[{policy_name:8s} gru] {cfg}  ->  {'PASS' if ok else 'FAIL'}")
+            for ln in lines:
+                print(ln)
+    else:
+        print(
+            "\n(skipping GRU parity: per-user GRU weights for users 1-6 not all present)"
+        )
 
     print()
     if all_ok:
