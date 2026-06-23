@@ -10,7 +10,8 @@ Design (see memory step2-fsrs7):
   - State per (deck, card): ``s_long, s_short, d`` (FSRS-7), plus ``due`` / ``last_date``
     as fractional days, ``ivl``, ``ease`` (SM-2 only), ``reps``, ``lapses``.
   - Outer loop over integer days; inner loop over same-day rounds (capped at
-    ``max_same_day`` reviews per card per day, default 10, so it can't blow up at 99% DR).
+    ``max_same_day`` reviews per card per day, default 8 = p99 of same-day review counts
+    measured across anki-revlogs-10k, so it can't blow up at 99% DR).
   - Each round, cards due ``< today + 1`` are reviewed at their own time
     ``t = max(due, today)`` (so ``delta_t = t - last_date`` is the real elapsed time),
     recall is drawn from the dual forgetting curve, the state + next interval are updated,
@@ -60,7 +61,7 @@ def simulate(
     seed=42,
     s_min=S_MIN_SECS,
     s_max=fsrs7.S_MAX,
-    max_same_day=10,
+    max_same_day=8,
     progress_desc=None,
     rng_kind="torch",
 ):
