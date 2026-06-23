@@ -343,6 +343,24 @@ pub(crate) fn forgetting_curve_inverse_newton(
 // BatchedGRU to ~1e-15 (identical math). Only nn.GRU is recurrent, so we carry h per card.
 const GRU_FLAT_LEN: usize = 505;
 
+/// Cached 2-curve forgetting-curve params (w, s, d) from a hidden state: the output of
+/// `GruW::curve`. It depends only on `h`, so the simulator caches it per card and refreshes
+/// it only when `h` changes (on a review step) -- the daily knowledge snapshot then reads
+/// these instead of re-running the GRU heads for every learned card every day.
+type GruCurve = ([f64; 2], [f64; 2], [f64; 2]);
+
+/// p(recall) after elapsed `dt` from cached curve params (the dt-dependent tail of
+/// `GruW::p_recall`; the dt-independent head `curve` is hoisted into the cache).
+#[inline]
+fn gru_p_recall_from(c: &GruCurve, dt: f64) -> f64 {
+    let (wc, sc, dc) = c;
+    let mut r = 0.0;
+    for k in 0..2 {
+        r += wc[k] * (1.0 + dt / (1e-7 + sc[k])).powf(-dc[k]);
+    }
+    (1.0 - 1e-7) * r
+}
+
 #[inline]
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
@@ -467,7 +485,7 @@ impl GruW {
 
     /// 2-curve forgetting-curve params (w, s, d) from the hidden state.
     #[inline]
-    fn curve(&self, h: &[f64; 7]) -> ([f64; 2], [f64; 2], [f64; 2]) {
+    fn curve(&self, h: &[f64; 7]) -> GruCurve {
         let g1 = layernorm7(h, &self.ln_post1);
         let mut e = [0.0; 7];
         for o in 0..7 {
@@ -506,16 +524,6 @@ impl GruW {
         )
     }
 
-    /// p(recall) after elapsed dt, given hidden state h. Mirrors BatchedGRU.p_recall.
-    #[inline]
-    fn p_recall(&self, h: &[f64; 7], dt: f64) -> f64 {
-        let (wc, sc, dc) = self.curve(h);
-        let mut r = 0.0;
-        for k in 0..2 {
-            r += wc[k] * (1.0 + dt / (1e-7 + sc[k])).powf(-dc[k]);
-        }
-        (1.0 - 1e-7) * r
-    }
 }
 
 #[pyfunction]
@@ -675,6 +683,13 @@ pub fn simulate_fsrs7<'py>(
         } else {
             Vec::new()
         };
+        // Per-card cache of curve(hgru[c]) (dt-independent GRU heads), kept in lock-step with
+        // hgru: initialised from the zero hidden, refreshed after every step. The daily
+        // snapshot and the recall draw read this instead of re-running the GRU heads.
+        let mut gcurve: Vec<GruCurve> = match &gw {
+            Some(g) => vec![g.curve(&[0.0; 7]); deck_size],
+            None => Vec::new(),
+        };
         // SSP-MMC per-user target-retention table, flattened [d, s_long, s_short].
         let ret_row: Option<Vec<f64>> = ret_view
             .as_ref()
@@ -692,7 +707,7 @@ pub fn simulate_fsrs7<'py>(
                 if s_long[c] > 0.0 {
                     let dt = (today_f - last_date[c]).max(0.0);
                     mem += match &gw {
-                        Some(g) => g.p_recall(&hgru[c], dt),
+                        Some(_g) => gru_p_recall_from(&gcurve[c], dt),
                         None => forgetting_curve(
                             dt,
                             s_long[c].clamp(s_min, s_max),
@@ -752,7 +767,7 @@ pub fn simulate_fsrs7<'py>(
                         dt = (t_review - last_date[c]).max(0.0);
                         let t_r = Instant::now();
                         let r = match &gw {
-                            Some(g) => g.p_recall(&hgru[c], dt),
+                            Some(_g) => gru_p_recall_from(&gcurve[c], dt),
                             None => forgetting_curve(
                                 dt,
                                 s_long[c].clamp(s_min, s_max),
@@ -825,6 +840,7 @@ pub fn simulate_fsrs7<'py>(
                     if let Some(g) = &gw {
                         let t_st = Instant::now();
                         hgru[c] = g.step(&hgru[c], dt, rating);
+                        gcurve[c] = g.curve(&hgru[c]); // keep the cache in lock-step with h
                         t_gru_ns += t_st.elapsed().as_nanos();
                     }
 
