@@ -116,9 +116,10 @@ Find **several hyperparameter sets that Pareto-beat fixed desired retention** on
   users, ~1000 evals via pymoo) to harvest decent hyperparameter seeds. **If it finds good sets,
   they seed a NEW ax run as the first manual candidates — NOT appended to the existing 65-trial
   checkpoint.** Start fresh so the warm-start isn't diluted by the old dominated trials.
-- **Future objective redesign — try later; keep Bellman, explicitly NOT ADR:** replace "min cost
-  to reach `S_MAX`" with **maximizing the sum of areas under the forgetting curve, priced against
-  time** — reward per review = `∫₀^Δ p_recall(τ)dτ − λ·(review cost)`, maximize the long-run sum,
+- **MARC — Maximize Accumulated Retention per Cost** (future objective redesign; try later; keep
+  Bellman, explicitly NOT ADR): replace "min cost to reach `S_MAX`" with **maximizing the sum of
+  areas under the forgetting curve, priced against time** — reward per review =
+  `∫₀^Δ p_recall(τ)dτ − λ·(review cost)`, maximize the long-run sum,
   drop the `S_MAX` terminal. That integral is literally the card's contribution to the measured
   knowledge metric, so the policy optimizes the true currency (recall-per-second) instead of an
   instrumental stability goal; `λ` = price of time (budget shadow price). Still a tabular
