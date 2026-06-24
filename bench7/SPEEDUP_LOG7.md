@@ -24,3 +24,4 @@ imbalance averages out, so expect closer to core count. Stacks multiplicatively 
 within-user iters above.
 | 2026-06-24 12:22:55 | 3 | 1.096x | 1.133x | 8.15e-12 | 0.000/0.000 | 0.000/0.000 | PASS | PASS | PASS | PASS | ACCEPT | GRU: f32 hot path (7-hidden net + 2-curve forgetting curve in f32; sim-only, weights cast f64->f32 in from_row) |
 | 2026-06-24 13:07:20 | 4 | 1.158x | 1.241x | 9.97e-12 | 0.034/0.299 | 0.236/2.114 | PASS | PASS | PASS | PASS | ACCEPT | FSRS: f32 hot path (sim-only f32 copies of the memory model + Newton inverse; per-card s_long/s_short/d carried in f32, time/RNG/cost stay f64) |
+| 2026-06-24 13:41:02 | 5 | 1.014x | 1.016x | 0.2027 | nan/nan | 73.443/542.998 | PASS | FAIL | FAIL | FAIL | REJECT | GRU: fastmath f32 transcendentals (pow in p_recall/curve heads, clamped exp in sigmoid/silu/tanh, ln in features) |
