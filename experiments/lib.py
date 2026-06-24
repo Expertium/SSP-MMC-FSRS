@@ -163,7 +163,12 @@ def normalize_button_usage(button_usage):
         if total <= 0:
             raise ValueError(f"{key} sums to zero: {value}")
         if not np.isclose(total, 1.0):
-            logging.warning("%s does not sum to 1 (%.6f); normalizing.", key, total)
+            # The official per-user button-usage probs are rounded to ~4 decimals, so
+            # they're routinely off by ~1e-4. That's pure rounding noise — normalize it
+            # silently. Only warn when the deviation is large enough to suggest a genuinely
+            # malformed distribution (which still gets normalized, just loudly).
+            if abs(total - 1.0) > 1e-3:
+                logging.warning("%s does not sum to 1 (%.6f); normalizing.", key, total)
             return value / total
         return value
 
