@@ -455,11 +455,28 @@ def _dr_dominated_indices(ssp_points, dr_points):
     return bad
 
 
+def _dr_efficient(dr_points):
+    """DR points on the (max knowledge, min time) Pareto frontier, sorted by knowledge.
+
+    The raw DR curve FOLDS BACK at high retention (past DR~0.94 knowledge drops while daily time
+    explodes toward the cost cap), so the high-DR tail is dominated. Keeping only the efficient
+    lower-left envelope makes knowledge->time monotonic, so np.interp below is valid (otherwise
+    the fold-back gives two wildly different times at the same knowledge and corrupts the compare).
+    """
+    pts = [(k, t) for _, k, t in dr_points]
+    eff = [
+        (k, t)
+        for k, t in pts
+        if not any((k2 >= k and t2 <= t and (k2 > k or t2 < t)) for k2, t2 in pts)
+    ]
+    return sorted(set(eff))
+
+
 def _beats_dr(ssp_points, dr_points):
     """SSP points that beat the DR front: less daily time than DR needs for the same knowledge."""
-    dk = sorted((k, t) for _, k, t in dr_points)
-    ks = [k for k, _ in dk]
-    ts = [t for _, t in dk]
+    eff = _dr_efficient(dr_points)
+    ks = [k for k, _ in eff]
+    ts = [t for _, t in eff]
     beats = []
     for params, k, t in ssp_points:
         dr_t = float(
