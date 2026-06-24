@@ -27,17 +27,19 @@ Run:
         --n-users 20 --total-trials 200 --seed 42
     (add --dr-baseline-only to just (re)build the DR front; --regen-dr-baseline to refresh it)
 
-NOTE (performance): per trial = N x (build + solve) + one batched sim. Transitions are
-hp-independent, so per-user solvers are built ONCE and reused across trials (build-once /
-solve-many). That caches N x ~113 MB of transitions in VRAM, which fits for small N on the
-4070. Scaling the tuning to the full 1000 users is a separate perf milestone (the transitions
-won't all fit, and N sequential solves/trial get expensive) -- this file is written
-N-agnostic so that milestone just raises N.
+NOTE (performance): per trial = N x (build + solve) + one batched sim, STREAMED -- each user's
+transitions (~113 MB on the production grid) are rebuilt, solved, reduced to a ~1.4 MB retention
+table, then freed, so peak VRAM stays ~3 GB for ANY N (caching all N is impossible: 1000 users
+-> ~113 GB, fits neither VRAM nor RAM). The per-user build+solve is ~0.34 s, GPU-saturated (the
+step-3 MPI+Triton work already made it cheap), so cross-user solve batching can't help; the sim
+is ~0.22 s/user on CPU (rayon). => ~9.4 min/trial at 1000 users (~16-24 h for a 100-150 trial
+tune). See the step5-optimizer memory.
 """
 
 import argparse
 import json
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -255,21 +257,35 @@ def parse_user_ids(spec):
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────────────────
-def _build_solvers(users):
-    """Build one SSPMMCSolver7 per user (transitions are hp-independent -> reuse across trials)."""
-    solvers = []
-    for i, uid in enumerate(users.uids):
-        solvers.append(
-            SSPMMCSolver7(
-                review_costs=users.rc[i],
-                first_rating_prob=users.frp[i],
-                review_rating_prob=users.rrp[i],
-                w=users.w[i],
-                s_state=S_GRID,
-                d_state=D_GRID,
-            )
+def _solve_all(hp, users, progress_every=250):
+    """Stream per-user build -> solve(hp) -> extract retention -> free (bounded VRAM at any N).
+
+    Per-user transitions are ~113 MB on the production grid, so caching all N (1000 -> ~113 GB)
+    fits neither VRAM nor RAM. Instead each trial REBUILDS transitions per user and frees them
+    immediately, keeping only the small (~1.4 MB) retention tables -> peak VRAM ~constant (~3 GB)
+    regardless of N. The build is ~3x the solve, but it's the price of not OOMing. (Measured
+    ~0.34 s/user, GPU-saturated, so this is the throughput floor; see step5-optimizer memory.)
+    Returns the stacked (N, d*s*s) retention table for the batched sim.
+    """
+    n = len(users)
+    ret_rows = []
+    for i in range(n):
+        solver = SSPMMCSolver7(
+            review_costs=users.rc[i],
+            first_rating_prob=users.frp[i],
+            review_rating_prob=users.rrp[i],
+            w=users.w[i],
+            s_state=S_GRID,
+            d_state=D_GRID,
         )
-    return solvers
+        _, rm = solver.solve(hp, verbose=False)
+        ret_rows.append(np.asarray(rm, np.float64).reshape(-1))
+        del solver
+        if CUDA:
+            torch.cuda.empty_cache()
+        if progress_every and (i + 1) % progress_every == 0:
+            print(f"    solved {i + 1}/{n} users", flush=True)
+    return np.ascontiguousarray(np.stack(ret_rows))
 
 
 def _simulate(users, policy, policy_param, retention_table):
@@ -310,16 +326,15 @@ def _objectives_from(mem, cost):
     return float(knowledge.mean()), float(time_min.mean())
 
 
-def evaluate_hp(hp, users, solvers):
-    """Solve the Bellman per user with `hp`, simulate all users batched, return objectives."""
-    ret_rows = []
-    for solver in solvers:
-        _, rm = solver.solve(hp, verbose=False)
-        ret_rows.append(np.asarray(rm, np.float64).reshape(-1))
-    ret_table = np.ascontiguousarray(np.stack(ret_rows))  # (N, d*s*s)
-    if CUDA:
-        torch.cuda.empty_cache()
+def evaluate_hp(hp, users):
+    """Stream-solve the Bellman per user with `hp`, simulate all users batched -> objectives."""
+    t0 = time.perf_counter()
+    ret_table = _solve_all(hp, users)  # (N, d*s*s)
+    t_solve = time.perf_counter() - t0
+    t1 = time.perf_counter()
     mem, cost = _simulate(users, "ssp_mmc", 0.0, ret_table)
+    t_sim = time.perf_counter() - t1
+    print(f"    [solve {t_solve:.0f}s + sim {t_sim:.0f}s]", flush=True)
     return _objectives_from(mem, cost)
 
 
@@ -329,10 +344,11 @@ def evaluate_dr(r, users):
     return _objectives_from(mem, cost)
 
 
-def multi_objective_function(param_dict, users, solvers):
-    knowledge, time_min = evaluate_hp(param_dict, users, solvers)
+def multi_objective_function(param_dict, users):
+    print(f"\nEvaluating {param_dict}", flush=True)
+    knowledge, time_min = evaluate_hp(param_dict, users)
     print(
-        f"\n{param_dict}\n  knowledge={knowledge:.1f} cards  time={time_min:.2f} min/day\n"
+        f"  knowledge={knowledge:.1f} cards  time={time_min:.2f} min/day\n", flush=True
     )
     # SEM left as None (noiseless): with 1 deck/user the per-user estimate is noisy, but the
     # mean over users is the objective; passing across-user SEM is a possible future refinement.
@@ -538,7 +554,6 @@ def propose_new_candidate(ssp_points, dr_points, rng):
 def run_optimizer(
     ax,
     users,
-    solvers,
     dr_baseline,
     out_dir,
     checkpoint,
@@ -587,7 +602,7 @@ def run_optimizer(
         print(f"Starting trial {i + 1}/{total_trials}")
         ax.complete_trial(
             trial_index=trial_index,
-            raw_data=multi_objective_function(params, users, solvers),
+            raw_data=multi_objective_function(params, users),
         )
         ax.save_to_json_file(str(checkpoint))
 
@@ -645,9 +660,6 @@ def main():
     if args.dr_baseline_only:
         return
 
-    print("Building per-user Bellman solvers (transitions reused across trials)...")
-    solvers = _build_solvers(users)
-
     checkpoint = out_dir / f"ssp_mmc7_seed{args.seed}.json"
     if checkpoint.exists():
         print(f"Resuming from {checkpoint}")
@@ -663,7 +675,6 @@ def main():
     run_optimizer(
         ax,
         users,
-        solvers,
         dr_baseline,
         out_dir,
         checkpoint,
