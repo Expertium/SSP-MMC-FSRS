@@ -31,9 +31,11 @@ NOTE (performance): per trial = N x (build + solve) + one batched sim, STREAMED 
 transitions (~113 MB on the production grid) are rebuilt, solved, reduced to a ~1.4 MB retention
 table, then freed, so peak VRAM stays ~3 GB for ANY N (caching all N is impossible: 1000 users
 -> ~113 GB, fits neither VRAM nor RAM). The per-user build+solve is ~0.34 s, GPU-saturated (the
-step-3 MPI+Triton work already made it cheap), so cross-user solve batching can't help; the sim
-is ~0.22 s/user on CPU (rayon). => ~9.4 min/trial at 1000 users (~16-24 h for a 100-150 trial
-tune). See the step5-optimizer memory.
+step-3 MPI+Triton work already made it cheap), so cross-user solve batching can't help; it is
+DECK-INDEPENDENT (the Bellman is on the S/D grid) and dominates the per-trial cost. The CPU sim
+(rayon) scales with deck x span. At the canonical DECK_SIZE=10000 / 5y / 1000 users that's roughly
+~340 s solve + a ~1-2 min sim => ~6-8 min/trial (~15-20 h for a 100-150 trial tune). See the
+step5-optimizer memory.
 """
 
 import argparse
@@ -58,6 +60,13 @@ import lib  # type: ignore  # noqa: E402
 
 import ssp_mmc_rust  # noqa: E402
 from ssp_mmc_fsrs import fsrs7  # noqa: E402
+from ssp_mmc_fsrs.config import (  # noqa: E402
+    DECK_SIZE,
+    LEARN_LIMIT_PER_DAY,
+    LEARN_SPAN,
+    MAX_STUDYING_TIME_PER_DAY,
+    REVIEW_LIMIT_PER_DAY,
+)
 from ssp_mmc_fsrs.gru import BatchedGRU  # noqa: E402
 from ssp_mmc_fsrs.simulation7 import S_MIN_SECS  # noqa: E402
 from ssp_mmc_fsrs.solver7 import (  # noqa: E402
@@ -80,12 +89,17 @@ D_GRID = build_production_d_grid()
 S_MIN = float(S_MIN_SECS)
 S_MAX = float(fsrs7.S_MAX)
 N_ITER = fsrs7.NEWTON_N_ITER  # sim's Newton scheduling-inverse count
-MAX_COST = 86400 / 2
-LEARN_LIMIT = 10
-REVIEW_LIMIT = 9999
-MAX_SAME_DAY = 8
-DECK = 3000
-SPAN = 365 * 3
+# Simulation sizes/limits IMPORTED from the project config (not hardcoded) so the tuning sim
+# matches the canonical setup and can't silently drift: DECK_SIZE=10000, LEARN_SPAN=5y,
+# LEARN_LIMIT_PER_DAY=10, MAX_STUDYING_TIME=12h, REVIEW_LIMIT=9999 ("unlim_time_lim_reviews").
+MAX_COST = MAX_STUDYING_TIME_PER_DAY
+LEARN_LIMIT = LEARN_LIMIT_PER_DAY
+REVIEW_LIMIT = REVIEW_LIMIT_PER_DAY
+MAX_SAME_DAY = (
+    8  # sim7-specific (not in config): same-day-review cap, p99 from anki-revlogs-10k
+)
+DECK = DECK_SIZE
+SPAN = LEARN_SPAN
 SIM_SEED = 42
 CUDA = torch.cuda.is_available()
 
