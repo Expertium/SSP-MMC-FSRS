@@ -49,6 +49,7 @@ import numpy as np
 import torch
 from ax.service.ax_client import AxClient
 from ax.service.utils.instantiation import ObjectiveProperties
+from scipy.interpolate import PchipInterpolator
 
 ROOT = Path(__file__).resolve().parents[1]
 for p in (ROOT, ROOT / "src"):
@@ -484,8 +485,8 @@ def _dr_efficient_labeled(dr_points):
     Keeps the DR label: returns ``[(dr, knowledge, time)]``. The raw DR curve FOLDS BACK at high
     retention (past DR~0.94 knowledge drops while daily time explodes toward the cost cap), so the
     high-DR tail is dominated. Keeping only the efficient lower-left envelope makes knowledge->time
-    monotonic, so the np.interp below is valid (otherwise the fold-back gives two wildly different
-    times at the same knowledge and corrupts the compare).
+    monotonic, so the PCHIP interpolation below is valid (it needs strictly increasing knowledge;
+    otherwise the fold-back gives two wildly different times at the same knowledge and corrupts it).
     """
     eff = [
         (dr, k, t)
@@ -497,6 +498,26 @@ def _dr_efficient_labeled(dr_points):
     return sorted(eff, key=lambda e: e[1])
 
 
+def _dr_time_at_knowledge_fn(eff):
+    """Build f(knowledge) -> DR daily time by interpolating the efficient DR frontier.
+
+    Uses a **monotone PCHIP** (shape-preserving cubic Hermite) through the frontier's
+    (knowledge, time) points instead of piecewise-linear np.interp: smooth, and because the
+    efficient frontier is monotone it introduces no overshoot. Queries are CLAMPED to the
+    frontier's knowledge range first (PCHIP extrapolates by default, which would give wild times
+    for an SSP point beyond the frontier; clamping reproduces np.interp's endpoint-hold). Falls
+    back to a constant for a degenerate 1-point frontier (PCHIP needs >= 2 points).
+    """
+    ks = np.asarray([k for _, k, _ in eff], dtype=float)
+    ts = np.asarray([t for _, _, t in eff], dtype=float)
+    if len(ks) < 2:
+        const = float(ts[0]) if len(ts) else 0.0
+        return lambda _k: const
+    pchip = PchipInterpolator(ks, ts, extrapolate=False)
+    lo, hi = float(ks[0]), float(ks[-1])
+    return lambda k: float(pchip(min(max(k, lo), hi)))
+
+
 def _compare_to_dr(ssp_points, dr_points):
     """Per SSP-MMC Pareto set, compare it to fixed DR.
 
@@ -505,19 +526,17 @@ def _compare_to_dr(ssp_points, dr_points):
     (max-knowledge, min-time) envelope from `_dr_efficient_labeled`) so the high-DR fold-back can't
     pick a nonsensical high-time match. `closest_dr` is the efficient DR level whose mean knowledge
     is nearest this set's. `beats` and `workload_reduction_pct` are measured at the set's EXACT
-    knowledge (apples-to-apples): interpolate the daily time DR would need to reach that same
+    knowledge (apples-to-apples): PCHIP-interpolate the daily time DR would need to reach that same
     knowledge, then `reduction = (dr_time - ssp_time) / dr_time` (negative if SSP-MMC is worse).
     """
     eff = _dr_efficient_labeled(
         dr_points
     )  # [(dr, knowledge, time)] sorted by knowledge
-    ks = [k for _, k, _ in eff]
-    ts = [t for _, _, t in eff]
+    dr_time_at = _dr_time_at_knowledge_fn(eff)
     out = []
     for params, k, t in ssp_points:
-        dr_t = float(
-            np.interp(k, ks, ts)
-        )  # DR's time at this set's knowledge (clamped)
+        # DR's daily time at this set's exact knowledge (monotone PCHIP, clamped to range).
+        dr_t = dr_time_at(k)
         closest_dr = min(eff, key=lambda e: abs(e[1] - k))[0]
         beats = t < dr_t - 1e-9
         reduction = (dr_t - t) / dr_t * 100.0 if dr_t > 0 else 0.0
@@ -625,6 +644,7 @@ def run_optimizer(
     seed,
     manual_start,
     manual_interval,
+    early_stop=True,
 ):
     completed = len(ax.experiment.trials)
     stable_checks = 0
@@ -652,7 +672,7 @@ def run_optimizer(
             stable_checks = (
                 stable_checks + 1 if rel_improvement < HYPERVOLUME_TOLERANCE else 0
             )
-            if stable_checks >= HYPERVOLUME_PATIENCE:
+            if early_stop and stable_checks >= HYPERVOLUME_PATIENCE:
                 print("Hypervolume plateaued -> early stop.")
                 break
 
@@ -702,6 +722,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--manual-start", type=int, default=MANUAL_CANDIDATE_START_TRIAL)
     ap.add_argument("--manual-interval", type=int, default=MANUAL_CANDIDATE_INTERVAL)
+    ap.add_argument(
+        "--no-early-stop",
+        action="store_true",
+        help="Disable the hypervolume-plateau early stop; run all --total-trials.",
+    )
     ap.add_argument("--dr-baseline-only", action="store_true")
     ap.add_argument("--regen-dr-baseline", action="store_true")
     ap.add_argument(
@@ -752,6 +777,7 @@ def main():
         args.seed,
         args.manual_start,
         args.manual_interval,
+        early_stop=not args.no_early_stop,
     )
 
 
