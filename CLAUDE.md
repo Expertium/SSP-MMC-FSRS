@@ -106,6 +106,24 @@ Find **several hyperparameter sets that Pareto-beat fixed desired retention** on
   for inspiration). If full CUDA isn't feasible, the **Rust** simulator (step 1) should
   at least give a large speedup over Python.
 
+**Step 5 findings & notes (in progress):**
+- **SSP-MMC is structurally dominated by fixed DR** under the current Bellman objective (min
+  cost-to-reach-`S_MAX`). Diagnostics confirmed the simulator is faithful (a constant-R retention
+  table reproduces fixed DR *exactly*) and the Bellman *can* reach high R, but the state-dependent
+  policy it produces is dominated by constant DR — it's the **objective** that's wrong, not the
+  tuner or a bug.
+- **NSGA-II seed pre-run** (`experiments/nsga_explore7.py`): a cheap multi-objective search (30
+  users, ~1000 evals via pymoo) to harvest decent hyperparameter seeds. **If it finds good sets,
+  they seed a NEW ax run as the first manual candidates — NOT appended to the existing 65-trial
+  checkpoint.** Start fresh so the warm-start isn't diluted by the old dominated trials.
+- **Future objective redesign — try later; keep Bellman, explicitly NOT ADR:** replace "min cost
+  to reach `S_MAX`" with **maximizing the sum of areas under the forgetting curve, priced against
+  time** — reward per review = `∫₀^Δ p_recall(τ)dτ − λ·(review cost)`, maximize the long-run sum,
+  drop the `S_MAX` terminal. That integral is literally the card's contribution to the measured
+  knowledge metric, so the policy optimizes the true currency (recall-per-second) instead of an
+  instrumental stability goal; `λ` = price of time (budget shadow price). Still a tabular
+  value-iteration solve (high capacity), unlike ADR's closed form.
+
 ### 5.5 Implement ADR (Adaptive Desired Retention) and benchmark it
 Implement **Cost ADR** — a compact, closed-form *desired-retention* policy `DR(stability,
 difficulty; cost_weight)` trained **directly on the simulator's knowledge-vs-time
