@@ -23,3 +23,4 @@ counts (one mega-user ~28s bounds the wall time). For step-5's 1000-user batches
 imbalance averages out, so expect closer to core count. Stacks multiplicatively with the
 within-user iters above.
 | 2026-06-24 12:22:55 | 3 | 1.096x | 1.133x | 8.15e-12 | 0.000/0.000 | 0.000/0.000 | PASS | PASS | PASS | PASS | ACCEPT | GRU: f32 hot path (7-hidden net + 2-curve forgetting curve in f32; sim-only, weights cast f64->f32 in from_row) |
+| 2026-06-24 13:07:20 | 4 | 1.158x | 1.241x | 9.97e-12 | 0.034/0.299 | 0.236/2.114 | PASS | PASS | PASS | PASS | ACCEPT | FSRS: f32 hot path (sim-only f32 copies of the memory model + Newton inverse; per-card s_long/s_short/d carried in f32, time/RNG/cost stay f64) |

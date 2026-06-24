@@ -1,9 +1,13 @@
-//! Rust port of the FSRS-7 simulator (roadmap step 2d), f64.
+//! Rust port of the FSRS-7 simulator (roadmap step 2d), f32 hot path.
 //!
 //! Reference / source of truth: `src/ssp_mmc_fsrs/simulation7.py` with `rng_kind="shared"`
-//! and the policies in `src/ssp_mmc_fsrs/policies7.py`. This is the **f64** port (matches
-//! the f64 Python reference closely; only cross-language libm differences remain). The f32
-//! hot-path conversion is a later speedup campaign, mirroring the FSRS-6 port.
+//! and the policies in `src/ssp_mmc_fsrs/policies7.py`. The memory model (s_long, s_short,
+//! d) + GRU run in **f32** for speed (the `*_f32` functions + the GRU); time, RNG, costs,
+//! `due` and the memorized accumulator stay f64. So it agrees with the f64 Python reference
+//! only to ~f32 level (a few review/learn cells shift, aggregates drift ~1e-3 -- gated by
+//! the bench7 drift budget; see tests/test_simulate7_parity tolerances). The f64 memory math
+//! (`forgetting_curve`, `update_state`, `forgetting_curve_inverse` Brent) is kept for the
+//! Bellman solver (`solver7.rs`), which needs f64 on its ill-conditioned grid.
 //!
 //! Differences from the FSRS-6 `simulate.rs`:
 //!   - 3-component memory state (s_long, s_short, d) and the dual-stability forgetting
@@ -11,7 +15,9 @@
 //!   - Same-day reviews: `due` is a fractional day and an inner same-day-rounds loop
 //!     re-reviews cards whose interval lands later the same day (capped at `max_same_day`
 //!     per card per day). The shared RNG gains a per-round counter dimension.
-//!   - The DR policy inverts the dual curve numerically (Brent's method).
+//!   - The DR/SSP policies invert the dual curve numerically (geomean-seeded Newton in f32;
+//!     the solver uses Brent in f64).
+//!   - The per-user axis runs in parallel (rayon), with the GIL released.
 //!
 //! Params are per-deck (the `parallel` axis = users): `w` is `(parallel, 34)`.
 
@@ -26,7 +32,6 @@ use rayon::prelude::*;
 
 use crate::rng;
 
-const S_MAX: f64 = 36500.0;
 const D_MIN: f64 = 1.0;
 const D_MAX: f64 = 10.0;
 const MIN_IVL: f64 = 1.0 / 1440.0; // 1 minute in days
@@ -162,15 +167,6 @@ fn next_difficulty(last_d: f64, rating: i64, retention: f64, w: &[f64]) -> f64 {
 }
 
 #[inline]
-fn init_state(rating: i64, w: &[f64], s_min: f64) -> (f64, f64, f64) {
-    let idx = (rating.clamp(1, 4) - 1) as usize;
-    let s_long = w[idx].clamp(s_min, S_MAX);
-    let s_short = (0.8 * w[idx]).clamp(s_min, S_MAX);
-    let d = init_d(rating, w).clamp(D_MIN, D_MAX);
-    (s_long, s_short, d)
-}
-
-#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_state(
     dt: f64,
@@ -295,22 +291,143 @@ pub(crate) fn forgetting_curve_inverse(
     b.clamp(log_min, log_max).exp()
 }
 
-/// SIMULATOR-ONLY fast inverse: weighted-geomean init + bracket-clamped Newton in log(t)
-/// (f64 mirror of fsrs7._newton_inverse). Newton's derivative reuses the same two powf()
-/// as the function eval, so a step costs ~one Brent f-eval but converges quadratically.
-/// Assumes realistic (well-conditioned) states; NOT safe on the full Bellman grid's flat
-/// corners -- the solver uses `forgetting_curve_inverse` (Brent) there.
+// ── f32 FSRS-7 hot path (SIMULATOR ONLY) ────────────────────────────────────────────
+// f32 mirrors of the memory model + Newton inverse for the simulator, where the per-card
+// state (s_long, s_short, d) is carried in f32. The f64 versions above stay for the Bellman
+// solver (solver7.rs), which needs f64 precision on its ill-conditioned grid. Direct f32
+// copies (same math, f32 literals); time/RNG/costs/due stay f64 in run_user.
+const S_MAX_F32: f32 = 36500.0;
+const D_MIN_F32: f32 = 1.0;
+const D_MAX_F32: f32 = 10.0;
+const MIN_IVL_F32: f32 = 1.0 / 1440.0;
+
+#[inline]
+fn short_component_recall_f32(t: f32, s_short: f32, w: &[f32]) -> f32 {
+    let t = t.max(0.0);
+    let mag = (w[23] * s_short.powf(w[33] - 0.3)).clamp(0.01, 0.95);
+    let decay1 = -mag;
+    let factor1 = ((w[25].ln() / decay1).min(60.0)).exp() - 1.0;
+    (t / s_short * factor1 + 1.0).powf(decay1)
+}
+
+#[inline]
+fn forgetting_curve_with_r1_f32(t: f32, s: f32, s_short: f32, d: f32, w: &[f32], r1: f32) -> f32 {
+    let t = t.max(0.0);
+    let decay2 = -(w[24].clamp(0.01, 0.95));
+    let factor2 = w[26].powf(1.0 / decay2) - 1.0;
+    let d_ts = ((d - 5.0) * (w[32] - 0.3)).exp();
+    let r2 = (t / s * factor2 * d_ts + 1.0).powf(decay2);
+    let weight1 = w[27] * s_short.powf(-w[29]);
+    let weight2 = w[28] * s.powf(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp();
+    let retention = (weight1 * r1 + weight2 * r2) / (weight1 + weight2);
+    retention * (1.0 - 2e-5) + 1e-5
+}
+
+#[inline]
+fn forgetting_curve_f32(t: f32, s: f32, s_short: f32, d: f32, w: &[f32]) -> f32 {
+    let r1 = short_component_recall_f32(t.max(0.0), s_short, w);
+    forgetting_curve_with_r1_f32(t, s, s_short, d, w, r1)
+}
+
+#[inline]
+fn next_stability_f32(
+    last_s: f32,
+    last_d: f32,
+    r: f32,
+    rating: i64,
+    start: usize,
+    w: &[f32],
+) -> f32 {
+    let hard = if rating == 2 { w[start + 6] } else { 1.0 };
+    let easy = if rating == 4 { w[start + 7] } else { 1.0 };
+    let new_s_fail =
+        w[start + 3] * ((last_s + 1.0).powf(w[start + 4]) - 1.0) * ((1.0 - r) * w[start + 5]).exp();
+    let pls = last_s.min(new_s_fail);
+    let sinc = (w[start] - 1.5).exp()
+        * (11.0 - last_d)
+        * last_s.powf(-w[start + 1])
+        * (((1.0 - r) * w[start + 2]).exp() - 1.0)
+        * hard
+        * easy
+        + 1.0;
+    let new_s_success = pls.max(last_s * sinc);
+    if rating > 1 {
+        new_s_success
+    } else {
+        pls
+    }
+}
+
+#[inline]
+fn init_d_f32(rating: i64, w: &[f32]) -> f32 {
+    w[4] - (w[5] * (rating as f32 - 1.0)).exp() + 1.0
+}
+
+#[inline]
+fn next_difficulty_f32(last_d: f32, rating: i64, retention: f32, w: &[f32]) -> f32 {
+    let delta_d0 = -w[6] * (rating as f32 - 3.0);
+    let delta_d = if rating == 1 {
+        delta_d0 * (retention + 0.1)
+    } else {
+        delta_d0
+    };
+    let new_d = last_d + delta_d * (10.0 - last_d) / 9.0;
+    let reverted = 0.01 * init_d_f32(4, w) + 0.99 * new_d;
+    reverted.clamp(D_MIN_F32, D_MAX_F32)
+}
+
+#[inline]
+fn init_state_f32(rating: i64, w: &[f32], s_min: f32) -> (f32, f32, f32) {
+    let idx = (rating.clamp(1, 4) - 1) as usize;
+    let s_long = w[idx].clamp(s_min, S_MAX_F32);
+    let s_short = (0.8 * w[idx]).clamp(s_min, S_MAX_F32);
+    let d = init_d_f32(rating, w).clamp(D_MIN_F32, D_MAX_F32);
+    (s_long, s_short, d)
+}
+
+#[inline]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn forgetting_curve_inverse_newton(
-    dr: f64,
-    s_long: f64,
-    s_short: f64,
-    d: f64,
-    w: &[f64],
+fn update_state_f32(
+    dt: f32,
+    rating: i64,
+    s_long: f32,
+    s_short: f32,
+    d: f32,
+    w: &[f32],
+    s_min: f32,
+    s_max: f32,
+) -> (f32, f32, f32) {
+    let last_s = s_long.clamp(s_min, s_max);
+    let last_s_short = s_short.clamp(s_min, s_max);
+    let last_d = d.clamp(D_MIN_F32, D_MAX_F32);
+    let r1 = short_component_recall_f32(dt, last_s_short, w);
+    let r = forgetting_curve_with_r1_f32(dt, last_s, last_s_short, last_d, w, r1);
+    let upd_s_long = next_stability_f32(last_s, last_d, r, rating, 7, w);
+    let upd_s_short_raw = next_stability_f32(last_s_short, last_d, r1, rating, 15, w);
+    let upd_s_short = if rating == 1 {
+        upd_s_short_raw.min(0.8 * upd_s_long)
+    } else {
+        upd_s_short_raw
+    };
+    let upd_d = next_difficulty_f32(last_d, rating, r, w);
+    (
+        upd_s_long.clamp(s_min, s_max),
+        upd_s_short.clamp(s_min, s_max),
+        upd_d.clamp(D_MIN_F32, D_MAX_F32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forgetting_curve_inverse_newton_f32(
+    dr: f32,
+    s_long: f32,
+    s_short: f32,
+    d: f32,
+    w: &[f32],
     n_iter: usize,
-    min_t: f64,
-    max_t: f64,
-) -> f64 {
+    min_t: f32,
+    max_t: f32,
+) -> f32 {
     let mag = (w[23] * s_short.powf(w[33] - 0.3)).clamp(0.01, 0.95);
     let decay1 = -mag;
     let factor1 = ((w[25].ln() / decay1).min(60.0)).exp() - 1.0;
@@ -342,9 +459,8 @@ pub(crate) fn forgetting_curve_inverse_newton(
         let p1 = i1.powf(decay1);
         let p2 = i2.powf(decay2);
         let f = c1 * p1 + c2 * p2 + 1e-5 - dr;
-        // dp/du = dp/dt * t; (1+a*t)^(decay-1) = p / (1+a*t), so no extra powf().
         let dfdu = (c1 * decay1 * a1 * p1 / i1 + c2 * decay2 * a2 * p2 / i2) * t;
-        let step = if dfdu.abs() < 1e-300 { 0.0 } else { f / dfdu };
+        let step = if dfdu.abs() < 1e-30 { 0.0 } else { f / dfdu };
         u = (u - step).clamp(u_lo, u_hi);
     }
     u.clamp(log_min, log_max).exp()
@@ -545,7 +661,6 @@ impl GruW {
             ],
         )
     }
-
 }
 
 /// Simulate ONE user's deck over the span (all owned inputs -> owned outputs), so the
@@ -588,10 +703,16 @@ fn run_user(
     let mut mem_out = vec![0.0f64; learn_span];
     let mut cost_out = vec![0.0f64; learn_span];
 
-    // per-card state (s_long == 0 marks not-yet-learned; due == +inf = unscheduled)
-    let mut s_long = vec![0.0f64; deck_size];
-    let mut s_short = vec![0.0f64; deck_size];
-    let mut diff = vec![0.0f64; deck_size];
+    // FSRS params + clamp bounds in f32 for the f32 memory-model hot path.
+    let wd_f32: Vec<f32> = wd.iter().map(|&x| x as f32).collect();
+    let s_min_f = s_min as f32;
+    let s_max_f = s_max as f32;
+
+    // per-card state: the memory state (s_long, s_short, d) is f32 (hot math + bandwidth);
+    // time/scheduling (last_date, due, ivl, same_day) stays f64 for fractional-day precision.
+    let mut s_long = vec![0.0f32; deck_size];
+    let mut s_short = vec![0.0f32; deck_size];
+    let mut diff = vec![0.0f32; deck_size];
     let mut last_date = vec![0.0f64; deck_size];
     let mut due = vec![f64::INFINITY; deck_size];
     let mut ivl = vec![0.0f64; deck_size];
@@ -630,13 +751,13 @@ fn run_user(
                 let dt = (today_f - last_date[c]).max(0.0);
                 mem += match &gw {
                     Some(_g) => gru_p_recall_from(&gcurve[c], dt),
-                    None => forgetting_curve(
-                        dt,
-                        s_long[c].clamp(s_min, s_max),
-                        s_short[c].clamp(s_min, s_max),
-                        diff[c].clamp(D_MIN, D_MAX),
-                        wd,
-                    ),
+                    None => forgetting_curve_f32(
+                        dt as f32,
+                        s_long[c].clamp(s_min_f, s_max_f),
+                        s_short[c].clamp(s_min_f, s_max_f),
+                        diff[c].clamp(D_MIN_F32, D_MAX_F32),
+                        &wd_f32,
+                    ) as f64,
                 };
             }
         }
@@ -669,9 +790,8 @@ fn run_user(
             let mut round_cost = 0.0f64;
 
             for c in 0..deck_size {
-                let rev_cand = s_long[c] > 0.0
-                    && due[c] < today_f + 1.0
-                    && same_day[c] < max_same_day as f64;
+                let rev_cand =
+                    s_long[c] > 0.0 && due[c] < today_f + 1.0 && same_day[c] < max_same_day as f64;
                 let learn_cand = rnd == 0 && s_long[c] == 0.0;
                 if !(rev_cand || learn_cand) {
                     continue;
@@ -686,13 +806,13 @@ fn run_user(
                     let t_r = Instant::now();
                     let r = match &gw {
                         Some(_g) => gru_p_recall_from(&gcurve[c], dt),
-                        None => forgetting_curve(
-                            dt,
-                            s_long[c].clamp(s_min, s_max),
-                            s_short[c].clamp(s_min, s_max),
-                            diff[c].clamp(D_MIN, D_MAX),
-                            wd,
-                        ),
+                        None => forgetting_curve_f32(
+                            dt as f32,
+                            s_long[c].clamp(s_min_f, s_max_f),
+                            s_short[c].clamp(s_min_f, s_max_f),
+                            diff[c].clamp(D_MIN_F32, D_MAX_F32),
+                            &wd_f32,
+                        ) as f64,
                     };
                     if gw.is_some() {
                         t_gru_ns += t_r.elapsed().as_nanos();
@@ -731,8 +851,10 @@ fn run_user(
 
                 if rev_cand {
                     let t_us = Instant::now();
-                    let (nsl, nss, nd) =
-                        update_state(dt, rating, s_long[c], s_short[c], diff[c], wd, s_min, s_max);
+                    let (nsl, nss, nd) = update_state_f32(
+                        dt as f32, rating, s_long[c], s_short[c], diff[c], &wd_f32, s_min_f,
+                        s_max_f,
+                    );
                     t_fsrs_ns += t_us.elapsed().as_nanos();
                     s_long[c] = nsl;
                     s_short[c] = nss;
@@ -741,7 +863,7 @@ fn run_user(
                     same_day[c] += 1.0;
                     day_reviews += 1;
                 } else {
-                    let (isl, iss, idd) = init_state(rating, wd, s_min);
+                    let (isl, iss, idd) = init_state_f32(rating, &wd_f32, s_min_f);
                     s_long[c] = isl;
                     s_short[c] = iss;
                     diff[c] = idd;
@@ -763,9 +885,16 @@ fn run_user(
                     Policy::Fixed => policy_param,
                     Policy::Dr => {
                         let t_inv = Instant::now();
-                        let v = forgetting_curve_inverse_newton(
-                            policy_param, s_long[c], s_short[c], diff[c], wd, n_iter, MIN_IVL, S_MAX,
-                        );
+                        let v = forgetting_curve_inverse_newton_f32(
+                            policy_param as f32,
+                            s_long[c],
+                            s_short[c],
+                            diff[c],
+                            &wd_f32,
+                            n_iter,
+                            MIN_IVL_F32,
+                            S_MAX_F32,
+                        ) as f64;
                         t_fsrs_ns += t_inv.elapsed().as_nanos();
                         v
                     }
@@ -775,13 +904,20 @@ fn run_user(
                         let dg = dgrid.unwrap();
                         let rt = ret_row.unwrap();
                         let ssz = sg.len();
-                        let sl_i = s2i(sg, s_long[c]);
-                        let ss_i = s2i(sg, s_short[c]);
-                        let d_i = d2i(dg, diff[c]);
+                        let sl_i = s2i(sg, s_long[c] as f64);
+                        let ss_i = s2i(sg, s_short[c] as f64);
+                        let d_i = d2i(dg, diff[c] as f64);
                         let target_r = rt[(d_i * ssz + sl_i) * ssz + ss_i];
-                        let v = forgetting_curve_inverse_newton(
-                            target_r, s_long[c], s_short[c], diff[c], wd, n_iter, MIN_IVL, S_MAX,
-                        );
+                        let v = forgetting_curve_inverse_newton_f32(
+                            target_r as f32,
+                            s_long[c],
+                            s_short[c],
+                            diff[c],
+                            &wd_f32,
+                            n_iter,
+                            MIN_IVL_F32,
+                            S_MAX_F32,
+                        ) as f64;
                         t_fsrs_ns += t_inv.elapsed().as_nanos();
                         v
                     }
@@ -848,7 +984,9 @@ fn run_user(
         cost_out[today] = cost_used;
     }
 
-    (review_out, learn_out, mem_out, cost_out, t_fsrs_ns, t_gru_ns)
+    (
+        review_out, learn_out, mem_out, cost_out, t_fsrs_ns, t_gru_ns,
+    )
 }
 
 #[pyfunction]
