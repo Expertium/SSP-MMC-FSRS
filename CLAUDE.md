@@ -106,15 +106,60 @@ Find **several hyperparameter sets that Pareto-beat fixed desired retention** on
   for inspiration). If full CUDA isn't feasible, the **Rust** simulator (step 1) should
   at least give a large speedup over Python.
 
+### 5.5 Implement ADR (Adaptive Desired Retention) and benchmark it
+Implement **Cost ADR** — a compact, closed-form *desired-retention* policy `DR(stability,
+difficulty; cost_weight)` trained **directly on the simulator's knowledge-vs-time
+hypervolume** (the true objective), instead of SSP-MMC's Bellman solve over a *proxy* cost.
+Reference (FSRS-7, Rust, already built):
+https://github.com/JSchoreels/fsrs-rs/tree/feature/fsrs-7-adr-optimization (`src/cost_adr.rs`,
+`docs/COST_ADR.MD`). The policy is a 15-coefficient form (basis `[1, x_s, x_d, x_s·x_d, x_s²]`
+over normalized log-stability + difficulty), with a single **`cost_weight` = price-of-time
+(Lagrangian λ)** that sweeps the workload↔knowledge Pareto front by construction (`cost_weight`
+0→1024 ⇒ avg DR ≈ 0.90→0.50). Its eval metrics (`fixed_fsrs_equivalent_desired_retention`,
+`same_target_time_saved_percent`, hypervolume-vs-fixed-DR) match ours (closest-DR /
+workload-reduction / hypervolume) — we converged on the same framing independently.
+
+**Why:** ADR dissolves the mesa/meta misalignment (no inner surrogate objective — the policy is
+fit end-to-end on the metric we measure) and is trivially Anki-portable (evaluate a closed form,
+no 3-D table). Open question: does SSP-MMC's high-capacity grid policy actually Pareto-beat ADR's
+compact closed form, or does the closed form capture ~all the gain?
+
+**Deliverable:** **benchmark ADR on 10k users with LSTM** as the pseudo-ground-truth p(recall),
+as a **3-way comparison on identical sims** — fixed DR vs SSP-MMC vs Cost ADR — reusing the
+step-6 harness. The idealized step-6 setup (constant per-review cost, no Hard/Easy) is the
+right model-pure arena (workload ∝ review count) to isolate which *policy* wins.
+
 ### 6. Full evaluation on 10k users
-Evaluate the good hyperparameter sets from step 5 on **10k users**, using **LSTM** as the
-pseudo-ground-truth p(recall) predictor.
+Evaluate **all scheduling policies** on **10k users** with **LSTM** as the pseudo-ground-truth
+p(recall), as a **6 policies × 7 setups matrix** (42 runs). This subsumes the step-5.5 ADR
+benchmark (ADR is just one of the policies here).
+
+**Policies (6):** fixed intervals, Memrise, Anki-SM-2, fixed-DR (FSRS-7), Cost ADR, SSP-MMC.
+
+**Setups (7) — independent one-change ablations from Standard** (each changes exactly ONE knob
+vs Standard, to isolate that variable's effect on the policy ranking; they do NOT stack):
+
+| # | Setup | Change vs Standard |
+| --- | --- | --- |
+| 1 | Standard | canonical sim: deck=10000, span=1825 (5y), learn_limit=10/day, review_limit=9999, MAX_COST=43200 (12h), per-user costs + rating probs, same-day cap=8 |
+| 2 | Constant time | all `learn_costs` **and** `review_costs` = **7 s** (every action, any grade — learning included) |
+| 3 | Good-only | fold **Hard+Easy into Good, Again unchanged**: `review_rating_prob=[0,1,0]` **and** `first_rating_prob=[Again, 0, 1-Again, 0]` (per-user Again mass kept; applies to learning too) |
+| 4 | Fuzz | **±5% interval fuzz** — NOT yet in the simulator; needs new Rust (+Python parity) code |
+| 5 | 1-year span | `span = 365` |
+| 6 | 1.5 h cap | `MAX_COST = 5400` |
+| 7 | 1 review/day | `MAX_SAME_DAY = 1` (no same-day reviews) |
+
+All 42 runs share the same 10k users + LSTM. Build note: setups 2/3/5/6/7 are config toggles;
+**setup 4 (fuzz) is the only one needing new simulator code.** Deliverable: per-(policy, setup)
+knowledge-vs-workload, with the same closest-DR / workload-reduction / hypervolume framing the
+step-5 optimizer uses (so each policy is read against fixed-DR within each setup).
 
 ## Experiment design summary
 
 | Phase | Users | Scheduler | Pseudo-GT p(recall) predictor | Tuner |
 | --- | --- | --- | --- | --- |
 | Hyperparameter optimization (step 5) | 1k | FSRS-7 | **GRU** | Bayesian (ax-platform) |
+| ADR implement + benchmark (step 5.5) | 10k | FSRS-7 + **Cost ADR** (vs SSP-MMC vs DR) | **LSTM** | evolutionary (ADR policy coeffs) |
 | Full evaluation (step 6) | 10k | FSRS-7 | **LSTM** | — (evaluate only) |
 
 Rationale: tune on a cheaper 1k-user set with GRU, then validate the surviving Pareto
