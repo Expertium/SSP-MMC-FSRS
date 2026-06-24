@@ -22,3 +22,4 @@ parallel=60 (all 60 datapoints in one call), same RNG cells.
 counts (one mega-user ~28s bounds the wall time). For step-5's 1000-user batches the
 imbalance averages out, so expect closer to core count. Stacks multiplicatively with the
 within-user iters above.
+| 2026-06-24 12:22:55 | 3 | 1.096x | 1.133x | 8.15e-12 | 0.000/0.000 | 0.000/0.000 | PASS | PASS | PASS | PASS | ACCEPT | GRU: f32 hot path (7-hidden net + 2-curve forgetting curve in f32; sim-only, weights cast f64->f32 in from_row) |

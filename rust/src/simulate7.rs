@@ -360,67 +360,76 @@ const GRU_FLAT_LEN: usize = 505;
 /// `GruW::curve`. It depends only on `h`, so the simulator caches it per card and refreshes
 /// it only when `h` changes (on a review step) -- the daily knowledge snapshot then reads
 /// these instead of re-running the GRU heads for every learned card every day.
-type GruCurve = ([f64; 2], [f64; 2], [f64; 2]);
+// f32 GRU hot path: the GRU is sim-only (the Bellman solver never touches it) and
+// experiment-only, so the 7-hidden net + 2-curve forgetting curve run in f32 (faster scalar
+// transcendentals + half the per-card hidden/cache bandwidth). Weights arrive as f64 and are
+// cast to f32 once in from_row; dt stays f64 and is cast at the boundary; p(recall) is
+// returned as f64 so the memorized sum and the recall draw vs the f64 RNG keep f64.
+type GruCurve = ([f32; 2], [f32; 2], [f32; 2]);
 
 /// p(recall) after elapsed `dt` from cached curve params (the dt-dependent tail of
-/// `GruW::p_recall`; the dt-independent head `curve` is hoisted into the cache).
+/// p_recall; the dt-independent head `curve` is hoisted into the cache). f32 internally.
 #[inline]
 fn gru_p_recall_from(c: &GruCurve, dt: f64) -> f64 {
     let (wc, sc, dc) = c;
-    let mut r = 0.0;
+    let dtf = dt as f32;
+    let mut r = 0.0f32;
     for k in 0..2 {
-        r += wc[k] * (1.0 + dt / (1e-7 + sc[k])).powf(-dc[k]);
+        r += wc[k] * (1.0 + dtf / (1e-7 + sc[k])).powf(-dc[k]);
     }
-    (1.0 - 1e-7) * r
+    ((1.0 - 1e-7) * r) as f64
 }
 
 #[inline]
-fn sigmoid(x: f64) -> f64 {
+fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 #[inline]
-fn silu(x: f64) -> f64 {
+fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 #[inline]
-fn layernorm7(x: &[f64; 7], gamma: &[f64; 7]) -> [f64; 7] {
-    let mean = x.iter().sum::<f64>() / 7.0;
-    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 7.0;
+fn layernorm7(x: &[f32; 7], gamma: &[f32; 7]) -> [f32; 7] {
+    let mean = x.iter().sum::<f32>() / 7.0;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 7.0;
     let inv = 1.0 / (var + 1e-5).sqrt();
-    let mut o = [0.0; 7];
+    let mut o = [0.0f32; 7];
     for i in 0..7 {
         o[i] = (x[i] - mean) * inv * gamma[i];
     }
     o
 }
+/// Read N consecutive f64 weights and cast to f32 (the GRU stores its weights in f32).
 #[inline]
-fn rd<const N: usize>(r: &[f64], o: &mut usize) -> [f64; N] {
-    let mut a = [0.0; N];
-    a.copy_from_slice(&r[*o..*o + N]);
+fn rd<const N: usize>(r: &[f64], o: &mut usize) -> [f32; N] {
+    let mut a = [0.0f32; N];
+    for i in 0..N {
+        a[i] = r[*o + i] as f32;
+    }
     *o += N;
     a
 }
 
 struct GruW {
-    pre_w: [f64; 35],
-    pre_b: [f64; 7],
-    ln_pre: [f64; 7],
-    w_ih: [f64; 147],
-    w_hh: [f64; 147],
-    b_ih: [f64; 21],
-    b_hh: [f64; 21],
-    ln_post1: [f64; 7],
-    post_w: [f64; 49],
-    post_b: [f64; 7],
-    ln_post2: [f64; 7],
-    w_fc_w: [f64; 14],
-    w_fc_b: [f64; 2],
-    s_fc_w: [f64; 14],
-    s_fc_b: [f64; 2],
-    d_fc_w: [f64; 14],
-    d_fc_b: [f64; 2],
-    input_mean: f64,
-    input_std: f64,
+    pre_w: [f32; 35],
+    pre_b: [f32; 7],
+    ln_pre: [f32; 7],
+    w_ih: [f32; 147],
+    w_hh: [f32; 147],
+    b_ih: [f32; 21],
+    b_hh: [f32; 21],
+    ln_post1: [f32; 7],
+    post_w: [f32; 49],
+    post_b: [f32; 7],
+    ln_post2: [f32; 7],
+    w_fc_w: [f32; 14],
+    w_fc_b: [f32; 2],
+    s_fc_w: [f32; 14],
+    s_fc_b: [f32; 2],
+    d_fc_w: [f32; 14],
+    d_fc_b: [f32; 2],
+    input_mean: f32,
+    input_std: f32,
 }
 
 impl GruW {
@@ -446,27 +455,27 @@ impl GruW {
             d_fc_w: rd::<14>(r, &mut o),
             d_fc_b: rd::<2>(r, &mut o),
             input_mean: {
-                let v = r[o];
+                let v = r[o] as f32;
                 o += 1;
                 v
             },
-            input_std: r[o],
+            input_std: r[o] as f32,
         }
     }
 
     #[inline]
-    fn features(&self, dt: f64, rating: i64) -> [f64; 5] {
-        let mut x = [0.0; 5];
-        x[0] = ((1e-5 + dt).ln() - self.input_mean) / self.input_std;
+    fn features(&self, dt: f64, rating: i64) -> [f32; 5] {
+        let mut x = [0.0f32; 5];
+        x[0] = ((1e-5 + dt as f32).ln() - self.input_mean) / self.input_std;
         x[1 + (rating.clamp(1, 4) - 1) as usize] = 1.0; // rating one-hot
         x
     }
 
     /// Advance the hidden state by one review (dt, rating). Mirrors BatchedGRU.step.
     #[inline]
-    fn step(&self, h: &[f64; 7], dt: f64, rating: i64) -> [f64; 7] {
+    fn step(&self, h: &[f32; 7], dt: f64, rating: i64) -> [f32; 7] {
         let x = self.features(dt, rating);
-        let mut a = [0.0; 7];
+        let mut a = [0.0f32; 7];
         for o in 0..7 {
             let mut s = self.pre_b[o];
             for i in 0..5 {
@@ -475,7 +484,7 @@ impl GruW {
             a[o] = silu(s);
         }
         let c = layernorm7(&a, &self.ln_pre);
-        let mut hn = [0.0; 7];
+        let mut hn = [0.0f32; 7];
         for i in 0..7 {
             // GRU gate order: reset (0..7), update (7..14), new (14..21).
             let (mut gir, mut giz, mut gin) = (self.b_ih[i], self.b_ih[7 + i], self.b_ih[14 + i]);
@@ -498,9 +507,9 @@ impl GruW {
 
     /// 2-curve forgetting-curve params (w, s, d) from the hidden state.
     #[inline]
-    fn curve(&self, h: &[f64; 7]) -> GruCurve {
+    fn curve(&self, h: &[f32; 7]) -> GruCurve {
         let g1 = layernorm7(h, &self.ln_post1);
-        let mut e = [0.0; 7];
+        let mut e = [0.0f32; 7];
         for o in 0..7 {
             let mut s = self.post_b[o];
             for i in 0..7 {
@@ -509,7 +518,7 @@ impl GruW {
             e[o] = silu(s);
         }
         let gg = layernorm7(&e, &self.ln_post2);
-        let (mut wl, mut sl, mut dl) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+        let (mut wl, mut sl, mut dl) = ([0.0f32; 2], [0.0f32; 2], [0.0f32; 2]);
         for o in 0..2 {
             let (mut sw, mut ss, mut sd) = (self.w_fc_b[o], self.s_fc_b[o], self.d_fc_b[o]);
             for i in 0..7 {
@@ -598,15 +607,15 @@ fn run_user(
 
     // GRU predictor state for this user (if enabled): per-user weights + per-card hidden h.
     let gw = gru_row.map(GruW::from_row);
-    let mut hgru: Vec<[f64; 7]> = if gw.is_some() {
-        vec![[0.0; 7]; deck_size]
+    let mut hgru: Vec<[f32; 7]> = if gw.is_some() {
+        vec![[0.0f32; 7]; deck_size]
     } else {
         Vec::new()
     };
     // Per-card cache of curve(hgru[c]) (dt-independent GRU heads), kept in lock-step with
     // hgru: initialised from the zero hidden, refreshed after every step.
     let mut gcurve: Vec<GruCurve> = match &gw {
-        Some(g) => vec![g.curve(&[0.0; 7]); deck_size],
+        Some(g) => vec![g.curve(&[0.0f32; 7]); deck_size],
         None => Vec::new(),
     };
 
