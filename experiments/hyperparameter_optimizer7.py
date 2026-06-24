@@ -108,7 +108,8 @@ DR_MIN, DR_MAX, DR_STEP = 0.60, 0.99, 0.01
 
 # The 13-D SSP-MMC cost-hyperparameter search space. Names == SSPMMCSolver7.solve() keys;
 # bounds mirror converge7.make_hyperparam_sets (base_fail is PINNED 1.0 inside the solver, so
-# it is not searched).
+# it is not searched), EXCEPT w_retention's upper bound is extended 3 -> 10 to let the tuner
+# reach higher-retention / higher-workload policies (the DR front runs to ~290 min/day).
 PARAMETERS = [
     {"name": "transform_s_long", "type": "choice", "values": ["no_log", "log"]},
     {"name": "transform_s_short", "type": "choice", "values": ["no_log", "log"]},
@@ -188,7 +189,7 @@ PARAMETERS = [
     {
         "name": "w_retention",
         "type": "range",
-        "bounds": [0.0, 3.0],
+        "bounds": [0.0, 10.0],
         "value_type": "float",
         "digits": 2,
     },
