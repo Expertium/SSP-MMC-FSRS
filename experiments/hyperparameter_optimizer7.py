@@ -359,11 +359,19 @@ def evaluate_dr(r, users):
     return _objectives_from(mem, cost)
 
 
-def multi_objective_function(param_dict, users):
+def multi_objective_function(param_dict, users, dr_points):
     print(f"\nEvaluating {param_dict}", flush=True)
     knowledge, time_min = evaluate_hp(param_dict, users)
+    print(f"  knowledge={knowledge:.1f} cards  time={time_min:.2f} min/day", flush=True)
+    # Per-trial DR comparison: how THIS trial's (knowledge, time) stacks against fixed DR
+    # (closest DR by knowledge, whether it beats DR, and the workload reduction at equal
+    # knowledge). Printed every trial, not just at the every-5-trials front rollup below.
+    c = _compare_to_dr([(param_dict, knowledge, time_min)], dr_points)[0]
+    print(f"    Closest DR: {c['closest_dr'] * 100:.0f}%")
+    print(f"    SSP-MMC beats: {c['beats']}")
     print(
-        f"  knowledge={knowledge:.1f} cards  time={time_min:.2f} min/day\n", flush=True
+        f"    SSP-MMC workload reduction: {c['workload_reduction_pct']:.1f}%\n",
+        flush=True,
     )
     # SEM left as None (noiseless): with 1 deck/user the per-user estimate is noisy, but the
     # mean over users is the objective; passing across-user SEM is a possible future refinement.
@@ -470,65 +478,89 @@ def _dr_dominated_indices(ssp_points, dr_points):
     return bad
 
 
-def _dr_efficient(dr_points):
+def _dr_efficient_labeled(dr_points):
     """DR points on the (max knowledge, min time) Pareto frontier, sorted by knowledge.
 
-    The raw DR curve FOLDS BACK at high retention (past DR~0.94 knowledge drops while daily time
-    explodes toward the cost cap), so the high-DR tail is dominated. Keeping only the efficient
-    lower-left envelope makes knowledge->time monotonic, so np.interp below is valid (otherwise
-    the fold-back gives two wildly different times at the same knowledge and corrupts the compare).
+    Keeps the DR label: returns ``[(dr, knowledge, time)]``. The raw DR curve FOLDS BACK at high
+    retention (past DR~0.94 knowledge drops while daily time explodes toward the cost cap), so the
+    high-DR tail is dominated. Keeping only the efficient lower-left envelope makes knowledge->time
+    monotonic, so the np.interp below is valid (otherwise the fold-back gives two wildly different
+    times at the same knowledge and corrupts the compare).
     """
-    pts = [(k, t) for _, k, t in dr_points]
     eff = [
-        (k, t)
-        for k, t in pts
-        if not any((k2 >= k and t2 <= t and (k2 > k or t2 < t)) for k2, t2 in pts)
+        (dr, k, t)
+        for dr, k, t in dr_points
+        if not any(
+            (k2 >= k and t2 <= t and (k2 > k or t2 < t)) for _, k2, t2 in dr_points
+        )
     ]
-    return sorted(set(eff))
+    return sorted(eff, key=lambda e: e[1])
 
 
-def _beats_dr(ssp_points, dr_points):
-    """SSP points that beat the DR front: less daily time than DR needs for the same knowledge."""
-    eff = _dr_efficient(dr_points)
-    ks = [k for k, _ in eff]
-    ts = [t for _, t in eff]
-    beats = []
+def _compare_to_dr(ssp_points, dr_points):
+    """Per SSP-MMC Pareto set, compare it to fixed DR.
+
+    Returns, for each set, its closest DR level (by knowledge), whether it beats DR, and its
+    workload reduction vs DR. All comparisons use the DR EFFICIENT frontier (the lower-left
+    (max-knowledge, min-time) envelope from `_dr_efficient_labeled`) so the high-DR fold-back can't
+    pick a nonsensical high-time match. `closest_dr` is the efficient DR level whose mean knowledge
+    is nearest this set's. `beats` and `workload_reduction_pct` are measured at the set's EXACT
+    knowledge (apples-to-apples): interpolate the daily time DR would need to reach that same
+    knowledge, then `reduction = (dr_time - ssp_time) / dr_time` (negative if SSP-MMC is worse).
+    """
+    eff = _dr_efficient_labeled(
+        dr_points
+    )  # [(dr, knowledge, time)] sorted by knowledge
+    ks = [k for _, k, _ in eff]
+    ts = [t for _, _, t in eff]
+    out = []
     for params, k, t in ssp_points:
         dr_t = float(
             np.interp(k, ks, ts)
-        )  # np.interp clamps outside the DR knowledge range
-        if t < dr_t - 1e-9:
-            beats.append(
-                {
-                    "params": params,
-                    "knowledge": k,
-                    "time_per_day_min": t,
-                    "dr_time_at_knowledge": dr_t,
-                }
-            )
-    return beats
+        )  # DR's time at this set's knowledge (clamped)
+        closest_dr = min(eff, key=lambda e: abs(e[1] - k))[0]
+        beats = t < dr_t - 1e-9
+        reduction = (dr_t - t) / dr_t * 100.0 if dr_t > 0 else 0.0
+        out.append(
+            {
+                "params": params,
+                "knowledge": k,
+                "time_per_day_min": t,
+                "closest_dr": closest_dr,
+                "dr_time_at_knowledge": dr_t,
+                "beats": beats,
+                "workload_reduction_pct": reduction,
+            }
+        )
+    return out
+
+
+def _print_dr_comparison(comparisons, header):
+    """Print each SSP-MMC Pareto set with its closest DR, beats verdict, and workload reduction."""
+    n_beat = sum(1 for c in comparisons if c["beats"])
+    print(
+        f"\n{header} ({n_beat}/{len(comparisons)} sets beat the DR front):", flush=True
+    )
+    for c in comparisons:
+        print(
+            f"  knowledge={c['knowledge']:.1f} cards  time={c['time_per_day_min']:.2f} min/day"
+        )
+        print(f"    Closest DR: {c['closest_dr'] * 100:.0f}%")
+        print(f"    SSP-MMC beats: {c['beats']}")
+        print(f"    SSP-MMC workload reduction: {c['workload_reduction_pct']:.1f}%")
+        print(f"    params: {c['params']}", flush=True)
 
 
 def report_and_save(frontier, dr_baseline, out_dir):
     ssp_points = _frontier_points(frontier)
     dr_points = _dr_points(dr_baseline)
-    beats = _beats_dr(ssp_points, dr_points)
+    comparisons = _compare_to_dr(ssp_points, dr_points)
+    beats = [c for c in comparisons if c["beats"]]
 
-    print("\nPareto-optimal SSP-MMC sets (knowledge, time/day min):")
-    for params, k, t in ssp_points:
-        print(f"    ({k:.1f}, {t:.2f})  {params}")
-    print(f"\n{len(beats)}/{len(ssp_points)} Pareto sets beat the DR front:")
-    for b in beats:
-        print(
-            f"    knowledge={b['knowledge']:.1f}  time={b['time_per_day_min']:.2f}  "
-            f"(DR needs {b['dr_time_at_knowledge']:.2f} min/day)  {b['params']}"
-        )
+    _print_dr_comparison(comparisons, "Pareto-optimal SSP-MMC sets vs fixed DR")
 
     out = {
-        "front": [
-            {"params": p, "knowledge": k, "time_per_day_min": t}
-            for p, k, t in ssp_points
-        ],
+        "front": comparisons,
         "beats_dr": beats,
         "dr_front": [
             {"dr": d, "knowledge": k, "time_per_day_min": t} for d, k, t in dr_points
@@ -597,10 +629,16 @@ def run_optimizer(
     completed = len(ax.experiment.trials)
     stable_checks = 0
     best_hv = None
+    dr_points = _dr_points(dr_baseline)  # fixed-DR front, reused every trial
 
     for i in range(completed, total_trials):
         if i > 0 and i % HYPERVOLUME_CHECK_INTERVAL == 0:
-            hv = _hypervolume(pareto_frontier(ax))
+            frontier = pareto_frontier(ax)
+            _print_dr_comparison(
+                _compare_to_dr(_frontier_points(frontier), dr_points),
+                f"[trial {i}] Pareto-vs-DR so far",
+            )
+            hv = _hypervolume(frontier)
             improvement = float("inf") if best_hv is None else hv - best_hv
             if best_hv is None or hv > best_hv + HYPERVOLUME_EPS:
                 best_hv = hv
@@ -622,7 +660,7 @@ def run_optimizer(
         if manual:
             ssp_points = _frontier_points(pareto_frontier(ax))
             cand = propose_new_candidate(
-                ssp_points, _dr_points(dr_baseline), np.random.default_rng(seed + i)
+                ssp_points, dr_points, np.random.default_rng(seed + i)
             )
             if cand is not None:
                 params, trial_index = cand, ax.attach_trial(parameters=cand)[1]
@@ -634,7 +672,7 @@ def run_optimizer(
         print(f"Starting trial {i + 1}/{total_trials}")
         ax.complete_trial(
             trial_index=trial_index,
-            raw_data=multi_objective_function(params, users),
+            raw_data=multi_objective_function(params, users, dr_points),
         )
         ax.save_to_json_file(str(checkpoint))
 
