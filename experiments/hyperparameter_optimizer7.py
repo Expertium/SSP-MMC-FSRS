@@ -570,7 +570,7 @@ def _print_dr_comparison(comparisons, header):
         print(f"    params: {c['params']}", flush=True)
 
 
-def report_and_save(frontier, dr_baseline, out_dir):
+def report_and_save(frontier, dr_baseline, out_dir, tag=""):
     ssp_points = _frontier_points(frontier)
     dr_points = _dr_points(dr_baseline)
     comparisons = _compare_to_dr(ssp_points, dr_points)
@@ -585,7 +585,7 @@ def report_and_save(frontier, dr_baseline, out_dir):
             {"dr": d, "knowledge": k, "time_per_day_min": t} for d, k, t in dr_points
         ],
     }
-    path = out_dir / "pareto7.json"
+    path = out_dir / f"pareto7{tag}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     json.dump(out, open(path, "w"), indent=2)
     print(f"\nSaved Pareto results to {path}")
@@ -645,12 +645,27 @@ def run_optimizer(
     manual_start,
     manual_interval,
     early_stop=True,
+    seed_candidates=None,
+    tag="",
 ):
-    completed = len(ax.experiment.trials)
     stable_checks = 0
     best_hv = None
     dr_points = _dr_points(dr_baseline)  # fixed-DR front, reused every trial
 
+    # Attach seed candidates (e.g. the NSGA front) as the first manual trials, re-evaluated on
+    # THESE users to warm-start the GP. Attaches only seeds not already in the checkpoint, so a
+    # crashed/resumed run picks up mid-seeding instead of double-attaching.
+    seeds = seed_candidates or []
+    for j in range(len(ax.experiment.trials), len(seeds)):
+        params, trial_index = ax.attach_trial(parameters=seeds[j])
+        print(f"Seeding {j + 1}/{len(seeds)} (manual candidate)")
+        ax.complete_trial(
+            trial_index=trial_index,
+            raw_data=multi_objective_function(params, users, dr_points),
+        )
+        ax.save_to_json_file(str(checkpoint))
+
+    completed = len(ax.experiment.trials)
     for i in range(completed, total_trials):
         if i > 0 and i % HYPERVOLUME_CHECK_INTERVAL == 0:
             frontier = pareto_frontier(ax)
@@ -697,7 +712,15 @@ def run_optimizer(
         ax.save_to_json_file(str(checkpoint))
 
     frontier = pareto_frontier(ax)
-    return report_and_save(frontier, dr_baseline, out_dir)
+    return report_and_save(frontier, dr_baseline, out_dir, tag)
+
+
+def load_seed_candidates(path):
+    """NSGA non-dominated front params from nsga_seeds.json (the front, not the w_ret sweep)."""
+    d = json.load(open(path))
+    if "nsga_front" in d:
+        return [e["params"] for e in d["nsga_front"]]
+    return d.get("seeds", [])
 
 
 def _label(uids):
@@ -730,6 +753,17 @@ def main():
     ap.add_argument("--dr-baseline-only", action="store_true")
     ap.add_argument("--regen-dr-baseline", action="store_true")
     ap.add_argument(
+        "--seed-candidates",
+        type=Path,
+        default=None,
+        help="Path to nsga_seeds.json; attach its NSGA front as the first manual trials.",
+    )
+    ap.add_argument(
+        "--tag",
+        default="",
+        help="Suffix for checkpoint/pareto filenames (use a fresh tag for a new seeded run).",
+    )
+    ap.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -755,7 +789,8 @@ def main():
     if args.dr_baseline_only:
         return
 
-    checkpoint = out_dir / f"ssp_mmc7_seed{args.seed}.json"
+    tag_suffix = f"_{args.tag}" if args.tag else ""
+    checkpoint = out_dir / f"ssp_mmc7_seed{args.seed}{tag_suffix}.json"
     if checkpoint.exists():
         print(f"Resuming from {checkpoint}")
         ax = AxClient.load_from_json_file(str(checkpoint))
@@ -766,6 +801,10 @@ def main():
             name="SSP-MMC-FSRS7", parameters=PARAMETERS, objectives=OBJECTIVES
         )
         ax.save_to_json_file(str(checkpoint))
+
+    seeds = load_seed_candidates(args.seed_candidates) if args.seed_candidates else None
+    if seeds:
+        print(f"Loaded {len(seeds)} seed candidates from {args.seed_candidates}")
 
     run_optimizer(
         ax,
@@ -778,6 +817,8 @@ def main():
         args.manual_start,
         args.manual_interval,
         early_stop=not args.no_early_stop,
+        seed_candidates=seeds,
+        tag=tag_suffix,
     )
 
 
