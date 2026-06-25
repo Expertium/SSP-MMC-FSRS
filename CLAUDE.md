@@ -123,7 +123,10 @@ Find **several hyperparameter sets that Pareto-beat fixed desired retention** on
   drop the `S_MAX` terminal. That integral is literally the card's contribution to the measured
   knowledge metric, so the policy optimizes the true currency (recall-per-second) instead of an
   instrumental stability goal; `λ` = price of time (budget shadow price). Still a tabular
-  value-iteration solve (high capacity), unlike ADR's closed form.
+  value-iteration solve (high capacity), unlike ADR's closed form. Build decisions: keep the current
+  S_long/S_short/D grid steps (redo the convergence study at build time); lower `S_max` to ~5–20 years
+  (clamp S>`S_max` → `S_max`); **keep R∈[0.60, 0.99]** (not widened down) so MARC stays in the same
+  desired-retention range as fixed DR (Anki's DR min 70%, likely → 60%).
 
 ### 5.5 Implement ADR (Adaptive Desired Retention) and benchmark it
 Implement **Cost ADR** — a compact, closed-form *desired-retention* policy `DR(stability,
