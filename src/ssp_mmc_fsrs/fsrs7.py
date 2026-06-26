@@ -84,6 +84,52 @@ def forgetting_curve(t, s, s_short, d, w):
     return retention * (1.0 - 2e-5) + 1e-5
 
 
+def forgetting_curve_area(t, s, s_short, d, w):
+    """Definite integral ``∫₀^t forgetting_curve(τ, s, s_short, d, w) dτ`` (units: card·days).
+
+    This is **closed-form** (no quadrature): the curve is a fixed convex combination of two
+    power curves ``r_i(τ) = (1 + a_i·τ)^decay_i`` whose coefficients depend only on the
+    START-of-interval state ``(s, s_short, d)`` — only ``τ`` varies — so each integrates
+    analytically via ``∫₀^t (1 + a·τ)^b dτ = ((1 + a·t)^(b+1) − 1) / (a·(b+1))``. The decays
+    clamp to ``(0.01, 0.95)`` so ``b+1 ∈ (0.05, 0.99)`` (no ``b = −1`` singularity), and
+    ``a_i > 0`` for realistic ``w`` (``factor_i = e^… − 1 > 0``).
+
+    Why it exists: a card scheduled with interval ``t`` contributes EXACTLY this area to the
+    simulator's knowledge metric (the across-days sum of ``p(recall)``). It is the retention
+    term of the **MARC** reward (``area − λ·cost``); see ``ssp_mmc_fsrs.marc``. Mirrors
+    ``forgetting_curve`` term-for-term; ``tests/test_fsrs7_area.py`` checks it against torch
+    quadrature.
+    """
+    t = t.clamp(min=0.0)
+
+    # Short-term component r1 (a1, decay1), exactly as in short_component_recall.
+    decay1 = -(w[23] * s_short.pow(w[33] - 0.3)).clamp(0.01, 0.95)
+    factor1 = (w[25].log() * decay1.pow(-1.0)).clamp(max=60.0).exp() - 1.0
+    a1 = factor1 / s_short
+
+    # Long-term component r2 (a2, decay2; difficulty on the time-scale), as in forgetting_curve.
+    decay2 = -w[24].clamp(0.01, 0.95)
+    factor2 = w[26].pow(decay2.pow(-1.0)) - 1.0
+    d_timescale = ((d - 5.0) * (w[32] - 0.3)).exp()
+    a2 = factor2 * d_timescale / s
+
+    # Mixture weights (weight2 is D-modulated), identical to forgetting_curve.
+    weight1 = w[27] * s_short.pow(-w[29])
+    weight2 = w[28] * s.pow(w[30]) * ((d - 5.0) * (w[31] - 0.5)).exp()
+
+    # ∫₀^t (1 + a·τ)^b dτ = ((1 + a·t)^(b+1) − 1) / (a·(b+1)), with b = decay_i.
+    b1 = decay1 + 1.0
+    b2 = decay2 + 1.0
+    int1 = ((a1 * t + 1.0).pow(b1) - 1.0) / (a1 * b1)
+    int2 = ((a2 * t + 1.0).pow(b2) - 1.0) / (a2 * b2)
+
+    # The mixture is a τ-independent weighted average of r1, r2, so its integral is the same
+    # weighted average of the component integrals. The final rescale of forgetting_curve
+    # (p = (1-2e-5)·retention + 1e-5) integrates term-by-term.
+    mix_area = (weight1 * int1 + weight2 * int2) / (weight1 + weight2)
+    return mix_area * (1.0 - 2e-5) + 1e-5 * t
+
+
 def next_stability(last_s, last_d, r, rating, start, w):
     """Stability after a review. ``start`` selects the parameter block: 7 for the
     long-term S, 15 for the short-term S. On success returns ``max(pls, last_s*sinc)``;

@@ -433,6 +433,7 @@ class SSPMMCSolver7:
         d_state=None,
         s_state=None,
         mpi_eval=20,
+        store_intervals=False,
     ):
         # Per-user inputs (CLAUDE.md: per-user FSRS params + per-button costs + H/G/E probs).
         self.review_costs = np.asarray(review_costs, dtype=np.float64)
@@ -448,6 +449,10 @@ class SSPMMCSolver7:
         # backup (0 => plain value iteration). MPI converges to the same unique V* in ~r_size x
         # fewer expensive greedy sweeps; benchmarked ~7x in experiments/accel_bench7.py.
         self.mpi_eval = int(mpi_eval)
+        # When True, _build_transitions also keeps the per-(state, action) scheduled interval
+        # in self._interval_flat (n_states, r_size). SSP-MMC doesn't need it; MARC does (to
+        # compute the closed-form retention area per action without re-running the inverse).
+        self._store_intervals = bool(store_intervals)
         # Optional non-uniform difficulty grid (e.g. fine at the extremes, coarse in the
         # flat middle). None -> the default uniform D_EPS grid.
         self._custom_d_state = (
@@ -568,6 +573,13 @@ class SSPMMCSolver7:
             for _ in range(4)
         ]
         self._r_pred_flat = torch.empty((n_states, r_size), device=dev, dtype=dt)
+        # MARC-only: the scheduled interval per (state, action), reused to integrate the
+        # forgetting curve into the retention-area reward (see ssp_mmc_fsrs.marc).
+        self._interval_flat = (
+            torch.empty((n_states, r_size), device=dev, dtype=dt)
+            if self._store_intervals
+            else None
+        )
 
         # Action grids that don't vary with the d-chunk.
         sl4 = self._sl3.unsqueeze(-1)  # (1, sl, 1, 1)
@@ -594,6 +606,8 @@ class SSPMMCSolver7:
 
                 row0, row1 = d0 * s_size * s_size, d1 * s_size * s_size
                 self._r_pred_flat[row0:row1] = r_pred.reshape(-1, r_size)
+                if self._interval_flat is not None:
+                    self._interval_flat[row0:row1] = t.reshape(-1, r_size)
                 for g in (1, 2, 3, 4):
                     rating = torch.tensor(float(g), device=dev, dtype=dt)
                     nsl, nss, nd = fsrs7.update_state(
